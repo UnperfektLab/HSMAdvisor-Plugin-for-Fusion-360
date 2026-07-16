@@ -1,0 +1,35 @@
+# Build intermediates / outputs
+Debug/
+Release/
+x64/
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.tlog
+*.idb
+*.iobj
+*.ipdb
+*.log
+
+# Built artifacts (produced by build.ps1 into the add-in folder)
+HSMAdvisorPlugin.dll
+HSMAdvisorPluginHost.exe
+
+# Installer build output
+installer/Output/
+dist/
+
+# Visual Studio user / cache files
+*.user
+.vs/
+
+# Runtime files generated in the add-in folder
+apply_prefs.txt
+dpi_mode.txt
+settings.xml
+
+# OS
+Thumbs.db
+desktop.ini
