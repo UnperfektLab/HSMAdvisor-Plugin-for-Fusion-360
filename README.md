@@ -9,7 +9,8 @@ tool, and apply the result back to the operation. Similar in spirit to
 > **Unofficial plugin.** Made by UnperfektLab. Not supported by HSMAdvisor / Eldar Gerfanov. 
 > It only drives your own separately installed, licensed copy of HSMAdvisor through its official DLL SDK.
 >
-> **Support:** for plugin problems, open an issue on this repo.
+> **Support:** for plugin problems, open an issue on this repo, or
+> [send an email](mailto:unperfektlab+hsmforfusion@gmail.com).
 
 <p align="center">
   <a href="https://github.com/UnperfektLab/HSMAdvisor-Plugin-for-Fusion-360/releases/latest/download/HSMAdvisor-Plugin-for-Fusion360-Setup.exe">
