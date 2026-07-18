@@ -37,6 +37,20 @@ static double readLenMm(const Ptr<CAMParameters>& params, const std::string& nam
     return fv ? fv->value() * 10.0 : fallback; // cm -> mm
 }
 
+// Reads the first candidate length that exists on this strategy.
+static double readFirstLenMm(const Ptr<CAMParameters>& params,
+                             const std::vector<std::string>& candidates)
+{
+    for (const std::string& name : candidates)
+    {
+        Ptr<CAMParameter> p = params ? params->itemByName(name) : nullptr;
+        if (!p) continue;
+        Ptr<FloatParameterValue> fv = p->value();
+        if (fv) return fv->value() * 10.0; // cm -> mm
+    }
+    return 0.0;
+}
+
 static int readInt(const Ptr<CAMParameters>& params, const std::string& name, int fallback)
 {
     Ptr<CAMParameter> p = params ? params->itemByName(name) : nullptr;
@@ -621,6 +635,11 @@ public:
         double stickout = readLenMm(tp, "tool_bodyLength", 0.0);
         if (stickout <= 0.0) stickout = oal;
 
+        // Operation engagement (ad/ae) to seed HSMAdvisor
+        Ptr<CAMParameters> ops = op->parameters();
+        double docIn = readLenMm(ops, "maximumStepdown", 0.0);
+        double wocIn = readFirstLenMm(ops, {"optimalLoad", "maximumStepover", "stepover"});
+
         if (diameter <= 0.0)
         {
             ui->messageBox("Could not read a valid tool diameter from the operation.", "HSMAdvisor Plugin");
@@ -647,7 +666,9 @@ public:
             << "shoulderLength=" << numToStr(shoulder, 4) << "\n"
             << "overallLength=" << numToStr(oal, 4) << "\n"
             << "shaftDiameter=" << numToStr(shaftDia, 4) << "\n"
-            << "stickout=" << numToStr(stickout, 4) << "\n";
+            << "stickout=" << numToStr(stickout, 4) << "\n"
+            << "docIn=" << numToStr(docIn, 4) << "\n"
+            << "wocIn=" << numToStr(wocIn, 4) << "\n";
 
         g_pendingOp = op;
         g_hostBusy = true;
@@ -655,8 +676,7 @@ public:
     }
 };
 
-// Static handler instances live for the whole add-in session. The EventHandler
-// base class disconnects itself from events on destruction.
+
 static OnExecuteHandler g_onExecute;
 
 class OnCommandCreatedHandler : public CommandCreatedEventHandler

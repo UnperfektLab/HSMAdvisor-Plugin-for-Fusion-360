@@ -317,7 +317,8 @@ static class Program
                    sd = GetD(inp, "shaftDiameter", 0), cr = GetD(inp, "cornerRadius", 0),
                    ta = GetD(inp, "taperAngle", 0), tipAng = GetD(inp, "tipAngle", 0),
                    sdia = GetD(inp, "shoulderDiameter", 0), pitch = GetD(inp, "threadPitch", 0),
-                   stickout = GetD(inp, "stickout", 0);
+                   stickout = GetD(inp, "stickout", 0),
+                   docIn = GetD(inp, "docIn", 0), wocIn = GetD(inp, "wocIn", 0);
             int flutes = GetInt(inp, "flutes", 0);
 
             // Build the tool fresh (geometry from Fusion, or the DB tool).
@@ -342,6 +343,10 @@ static class Program
             // setup. Skipped for types that don't take it (tap).
             if (stickout > 0 && FieldsFor(MapToolType(toolType, strategy)).HasFlag(G.Stickout))
                 calc.Stickout = stickout;
+
+            // Seed HSMAdvisor's cut engagement from the operation's
+            if (docIn > 0) try { calc.DOC = docIn; } catch { }
+            if (wocIn > 0) try { calc.WOC = wocIn; } catch { }
 
             // Restore the unit mode the user last left the dialog.
             try { calc.SetMetric(ReadRememberedMetric()); } catch { }
