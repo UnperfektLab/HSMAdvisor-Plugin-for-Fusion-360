@@ -525,6 +525,10 @@ static class Program
         calc.SetToolMaterial(MapToolMaterial(toolMaterial));
         calc.SetToolCoating(Enums.ToolCoatings.None);
 
+        // Helix = -1 is HSMAdvisor "unknown, use the default" convention,
+        // the dialog shows the tool type's default helix for it.
+        try { calc.Helix = -1; } catch { }
+
         // Lengths / flutes / taper / diameter.
         if (has.HasFlag(G.Flutes) && flutes > 0) calc.Flute_N = flutes;
         if (has.HasFlag(G.FluteLen) && fl > 0) calc.Flute_Len = fl;
