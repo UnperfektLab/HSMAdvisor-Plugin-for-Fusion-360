@@ -398,14 +398,26 @@ static void applyHostResult(const Ptr<Operation>& op, const std::map<std::string
     std::string rpmExpr = numToStr((double)rpm, 0) + "rpm";
     std::string cutExpr = numToStr(feedCut, 1) + "mmpm";
 
+    // If is drilling operations then set feed as plunge feed, otherwise set as cutting feed.
+    std::string strat = op->strategy();
+    for (char& c : strat) if (c >= 'A' && c <= 'Z') c += 32;
+    bool isDrill = (strat == "drill");
+
     if (ap_rpm)
         writeExpr(ops, "tool_spindleSpeed", rpmExpr, failed);
     if (ap_feed)
     {
-        writeExpr(ops, "tool_feedCutting", cutExpr, failed);
-        writeExpr(ops, "tool_feedEntry", cutExpr, failed);
-        writeExpr(ops, "tool_feedExit", cutExpr, failed);
-        writeExpr(ops, "tool_feedTransition", cutExpr, failed);
+        if (isDrill)
+        {
+            writeExpr(ops, "tool_feedPlunge", cutExpr, failed);
+        }
+        else
+        {
+            writeExpr(ops, "tool_feedCutting", cutExpr, failed);
+            writeExpr(ops, "tool_feedEntry", cutExpr, failed);
+            writeExpr(ops, "tool_feedExit", cutExpr, failed);
+            writeExpr(ops, "tool_feedTransition", cutExpr, failed);
+        }
     }
 
     // DOC (ad): write maximumStepdown but deliberately leave doMultipleDepths alone
@@ -437,7 +449,7 @@ static void applyHostResult(const Ptr<Operation>& op, const std::map<std::string
     msg.precision(0);
     if (ap_rpm)  msg << "Spindle:  " << (double)rpm << " rpm\n";
     msg.precision(metric ? 1 : 2);
-    if (ap_feed) msg << "Cutting:  " << feedCut * disp << " " << feedUnit << "\n";
+    if (ap_feed) msg << (isDrill ? "Plunge:  " : "Cutting:  ") << feedCut * disp << " " << feedUnit << "\n";
     msg.precision(metric ? 3 : 4);
     if (ap_ad)
         msg << "DOC: " << doc * disp << " " << lenUnit
