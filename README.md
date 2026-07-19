@@ -1,4 +1,4 @@
-# HSMAdvisor Plugin for Fusion 360
+# <img width="64" height="64" alt="64x64" src="https://github.com/user-attachments/assets/bfa0f32f-ecb4-4e21-975f-7ab867ed68be" /> HSMAdvisor Plugin for Fusion 360
 
 An unofficial, third-party Fusion 360 plugin that brings
 [HSMAdvisor](https://hsmadvisor.com/)'s feeds and speeds calculator into the
@@ -9,8 +9,11 @@ tool, and apply the result back to the operation. Similar in spirit to
 > **Unofficial plugin.** Made by UnperfektLab. Not supported by HSMAdvisor / Eldar Gerfanov. 
 > It only drives your own separately installed, licensed copy of HSMAdvisor through its official DLL SDK.
 >
-> **Support:** for plugin problems, open an issue on this repo, or
-> [send an email](mailto:unperfektlab+hsmforfusion@gmail.com).
+> **Support and feedback:** report a bug in
+> [Issues](https://github.com/UnperfektLab/HSMAdvisor-Plugin-for-Fusion-360/issues),
+> ask a question or share an idea in
+> [Discussions](https://github.com/UnperfektLab/HSMAdvisor-Plugin-for-Fusion-360/discussions),
+> or [send an email](mailto:unperfektlab+hsmforfusion@gmail.com).
 
 <p align="center">
   <a href="https://github.com/UnperfektLab/HSMAdvisor-Plugin-for-Fusion-360/releases/latest/download/HSMAdvisor-Plugin-for-Fusion360-Setup.exe">
