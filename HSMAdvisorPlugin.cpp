@@ -393,6 +393,7 @@ static void applyHostResult(const Ptr<Operation>& op, const std::map<std::string
     double feedCut = strtod(kvGet(out, "feedCut", "0").c_str(), nullptr);
     double doc     = strtod(kvGet(out, "doc", "0").c_str(), nullptr);
     double woc     = strtod(kvGet(out, "woc", "0").c_str(), nullptr);
+    double peck    = strtod(kvGet(out, "peck", "0").c_str(), nullptr);
 
     Ptr<CAMParameters> ops = op->parameters();
     if (!ops)
@@ -434,21 +435,30 @@ static void applyHostResult(const Ptr<Operation>& op, const std::map<std::string
         }
     }
 
-    // DOC (ad): write maximumStepdown but deliberately leave doMultipleDepths alone
-    // the user controls whether Multiple Depths is on.
+    // Depth of cut (ad): for milling write maximumStepdown (leaving doMultipleDepths alone,
+    // the user controls that), for drilling write peckingDepth from hsmadvisor peek value.
     std::string docParam, wocParam;
-    if (ap_ad && doc > 0.0)
+    bool peckWritten = false;
+    if (ap_ad && isDrill)
     {
-        if (trySet(ops, "maximumStepdown", numToStr(doc, 3) + "mm") == SetResult::Ok)
-            docParam = "maximumStepdown";
-        else
-            failed.push_back("maximumStepdown");
+        if (peck > 0.0)
+            peckWritten = (trySet(ops, "peckingDepth", numToStr(peck, 3) + "mm") == SetResult::Ok);
     }
-    // WOC (ae): parameter name varies by strategy, try each in turn. (temporary solution)
-    if (ap_ae && woc > 0.0)
-        wocParam = setFirstExisting(
-            ops, {"optimalLoad", "maximumStepover", "stepover"},
-            numToStr(woc, 3) + "mm", failed);
+    else
+    {
+        if (ap_ad && doc > 0.0)
+        {
+            if (trySet(ops, "maximumStepdown", numToStr(doc, 3) + "mm") == SetResult::Ok)
+                docParam = "maximumStepdown";
+            else
+                failed.push_back("maximumStepdown");
+        }
+        // WOC (ae): parameter name varies by strategy, try each in turn. (temporary solution)
+        if (ap_ae && woc > 0.0)
+            wocParam = setFirstExisting(
+                ops, {"optimalLoad", "maximumStepover", "stepover"},
+                numToStr(woc, 3) + "mm", failed);
+    }
 
     // Values are always written in mm (Fusion converts them via the unit tokens), but the
     // summary is shown in the document's own units so it matches what the user sees.
@@ -465,12 +475,18 @@ static void applyHostResult(const Ptr<Operation>& op, const std::map<std::string
     msg.precision(metric ? 1 : 2);
     if (ap_feed) msg << (isDrill ? "Plunge:  " : "Cutting:  ") << feedCut * disp << " " << feedUnit << "\n";
     msg.precision(metric ? 3 : 4);
-    if (ap_ad)
-        msg << "DOC: " << doc * disp << " " << lenUnit
-            << (docParam.empty() ? "  (no depth param on this strategy)" : "  -> " + docParam) << "\n";
-    if (ap_ae)
-        msg << "WOC: " << woc * disp << " " << lenUnit
-            << (wocParam.empty() ? "  (no radial param on this strategy)" : "  -> " + wocParam) << "\n";
+    if (ap_ad && isDrill)
+        msg << "Peck: " << peck * disp << " " << lenUnit
+            << (peckWritten ? "  -> peckingDepth" : "  (no peck value)") << "\n";
+    else
+    {
+        if (ap_ad)
+            msg << "DOC: " << doc * disp << " " << lenUnit
+                << (docParam.empty() ? "  (no depth param on this strategy)" : "  -> " + docParam) << "\n";
+        if (ap_ae)
+            msg << "WOC: " << woc * disp << " " << lenUnit
+                << (wocParam.empty() ? "  (no radial param on this strategy)" : "  -> " + wocParam) << "\n";
+    }
     msg << "\nRegenerate the toolpath to see the update.";
     if (!failed.empty())
     {

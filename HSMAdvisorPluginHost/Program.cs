@@ -390,6 +390,7 @@ static class Program
             outv["feedPlunge"] = Inv(res.FEED_Plunge);
             outv["doc"] = Inv(res.DOC);
             outv["woc"] = Inv(res.WOC);
+            outv["peck"] = Inv(res.Peck);
             outv["sfm"] = Inv(res.Real_SFM);
             outv["chipload"] = Inv(res.Real_IPT);
             return outv;
