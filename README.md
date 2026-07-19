@@ -27,6 +27,8 @@ tool, and apply the result back to the operation. Similar in spirit to
 
 <p align="center"><b>Download → run the installer → restart Fusion 360.</b></p>
 
+<img width="700" height="394" alt="HSM" src="https://github.com/user-attachments/assets/8b188a5c-61db-42d0-a51f-7cbe7e6f5a48" />
+
 ## Requirements
 
 - Windows 10 (1903+) or Windows 11, 64-bit.
