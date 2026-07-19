@@ -9,6 +9,8 @@
 #include <Cam/CamAll.h>
 
 #include <windows.h>
+#include <urlmon.h>
+#include <shellapi.h>
 #include <string>
 #include <sstream>
 #include <fstream>
@@ -16,6 +18,9 @@
 #include <map>
 #include <cstdlib>
 #include <thread>
+
+#pragma comment(lib, "urlmon.lib")
+#pragma comment(lib, "shell32.lib")
 
 using namespace adsk::core;
 using namespace adsk::fusion;
@@ -381,6 +386,58 @@ static std::map<std::string, std::string> g_pendingResult; // last host result, 
 static const char* kApplyCmdId = "HSMAdvisorApplyCmd";
 static Ptr<CommandDefinition> g_applyCmdDef;
 
+// If the host reported a newer release, offer a one-click update (once per session).
+static bool g_updateOffered = false;
+static void maybeOfferUpdate(const std::map<std::string, std::string>& out)
+{
+    if (g_updateOffered) return;
+    std::string ver = kvGet(out, "updateVersion", "");
+    if (ver.empty()) return;
+    g_updateOffered = true; // ask at most once per session, whatever the answer
+
+    std::string cur = kvGet(out, "currentVersion", "");
+    std::string url = kvGet(out, "updateUrl", "");
+    const std::string relPage =
+        "https://github.com/UnperfektLab/HSMAdvisor-Plugin-for-Fusion-360/releases/latest";
+
+    std::string msg = "A new version of HSMAdvisor Plugin is available.\n\n";
+    msg += "Installed: " + (cur.empty() ? std::string("(unknown)") : cur) + "\n";
+    msg += "Available: " + ver + "\n\n";
+    msg += url.empty()
+        ? "Open the download page in your browser?"
+        : "Download and run the installer now?\nYou will need to close Fusion 360 for it to finish.";
+
+    DialogResults ans = ui->messageBox(msg, "HSMAdvisor Plugin update",
+                                       YesNoButtonType, QuestionIconType);
+    if (ans != DialogYes) return;
+
+    if (url.empty())
+    {
+        ShellExecuteW(nullptr, L"open", utf8ToWide(relPage).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        return;
+    }
+
+    char tmp[MAX_PATH] = {0};
+    GetTempPathA(MAX_PATH, tmp);
+    std::string dest = std::string(tmp) + "HSMAdvisor-Plugin-Setup.exe";
+
+    HRESULT hr = URLDownloadToFileW(nullptr, utf8ToWide(url).c_str(),
+                                    utf8ToWide(dest).c_str(), 0, nullptr);
+    if (SUCCEEDED(hr))
+    {
+        ShellExecuteW(nullptr, L"open", utf8ToWide(dest).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        ui->messageBox(
+            "The installer has started.\n\n"
+            "Please CLOSE Fusion 360 so it can update the plugin, then restart Fusion.",
+            "HSMAdvisor Plugin update");
+    }
+    else
+    {
+        // Download failed (offline, etc.) -> fall back to the release page.
+        ShellExecuteW(nullptr, L"open", utf8ToWide(relPage).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    }
+}
+
 // Writes the selected feeds & speeds into the operation. Assumes the result is valid
 // (status ok); the caller decides whether to invoke it.
 static void applyHostResult(const Ptr<Operation>& op, const std::map<std::string, std::string>& out)
@@ -496,9 +553,12 @@ static void applyHostResult(const Ptr<Operation>& op, const std::map<std::string
     }
 
     ui->messageBox(msg.str(), "HSMAdvisor Plugin");
+
+    // After the apply, surface any available plugin update (once per session).
+    maybeOfferUpdate(out);
 }
 
-// Fired when the host has returned a result. On success it opensthe "what to apply" chooser 
+// Fired when the host has returned a result. On success it opensthe "what to apply" chooser
 // (g_hostBusy stays true until the chooser is destroyed).
 class HostDoneHandler : public CustomEventHandler
 {

@@ -79,7 +79,7 @@ $hostExe = Join-Path $root 'HSMAdvisorPluginHost.exe'
 & $csc /nologo /target:winexe /platform:x64 /langversion:latest `
     /reference:"$hsm\HSMAdvisorCore.dll" /reference:"$hsm\HSMAdvisorDatabase.dll" `
     /reference:'System.Windows.Forms.dll' /reference:'System.Drawing.dll' `
-    /reference:'System.Core.dll' /reference:'System.Xml.dll' `
+    /reference:'System.dll' /reference:'System.Core.dll' /reference:'System.Xml.dll' `
     /out:"$hostExe" "$root\HSMAdvisorPluginHost\Program.cs"
 if ($LASTEXITCODE -ne 0) { throw "Host (C#) build failed." }
 

@@ -16,8 +16,10 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.IO.Pipes;
+using System.Net;
 using System.Reflection;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Windows.Forms;
 using System.Xml;
@@ -299,10 +301,94 @@ static class Program
         catch { }
     }
 
+    // ---- update check (GitHub Releases) --------------------------------------
+    const string kUpdateApi =
+        "https://api.github.com/repos/UnperfektLab/HSMAdvisor-Plugin-for-Fusion-360/releases/latest";
+    static volatile string _updateVersion;
+    static volatile string _updateUrl;
+    static int _updateStarted;
+
+    // Current version = the add-in manifest's version.
+    static string CurrentVersion()
+    {
+        try
+        {
+            foreach (var f in Directory.GetFiles(AppDomain.CurrentDomain.BaseDirectory, "*.manifest"))
+            {
+                var m = Regex.Match(File.ReadAllText(f), "\"version\"\\s*:\\s*\"([^\"]+)\"");
+                if (m.Success) return m.Groups[1].Value;
+            }
+        }
+        catch { }
+        return "0.0.0";
+    }
+
+    static int[] ParseVer(string s)
+    {
+        s = (s ?? "").TrimStart('v', 'V');
+        string[] parts = s.Split('.');
+        var r = new int[3];
+        for (int i = 0; i < 3 && i < parts.Length; i++)
+        {
+            string digits = "";
+            foreach (char c in parts[i]) { if (c >= '0' && c <= '9') digits += c; else break; }
+            int.TryParse(digits, out r[i]);
+        }
+        return r;
+    }
+
+    static int CompareVersions(string a, string b)
+    {
+        int[] pa = ParseVer(a), pb = ParseVer(b);
+        for (int i = 0; i < 3; i++) if (pa[i] != pb[i]) return pa[i] < pb[i] ? -1 : 1;
+        return 0;
+    }
+
+    static void StartUpdateCheck()
+    {
+        if (Interlocked.Exchange(ref _updateStarted, 1) != 0) return;
+        if (File.Exists(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "no_update_check.txt"))) return;
+        var t = new Thread(() =>
+        {
+            try
+            {
+                ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
+                var req = (HttpWebRequest)WebRequest.Create(kUpdateApi);
+                req.UserAgent = "HSMAdvisorPlugin-update-check";
+                req.Accept = "application/vnd.github+json";
+                req.Timeout = 5000;
+                string json;
+                using (var resp = (HttpWebResponse)req.GetResponse())
+                using (var sr = new StreamReader(resp.GetResponseStream()))
+                    json = sr.ReadToEnd();
+
+                var tagM = Regex.Match(json, "\"tag_name\"\\s*:\\s*\"([^\"]+)\"");
+                if (!tagM.Success) return;
+                string tag = tagM.Groups[1].Value;
+                if (CompareVersions(tag, CurrentVersion()) <= 0) return;
+                
+                string url = null;
+                foreach (Match m in Regex.Matches(json, "\"browser_download_url\"\\s*:\\s*\"([^\"]+)\""))
+                {
+                    string u = m.Groups[1].Value;
+                    if (!u.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) continue;
+                    url = u;
+                    if (u.IndexOf("Setup", StringComparison.OrdinalIgnoreCase) >= 0) break;
+                }
+                _updateUrl = url;
+                _updateVersion = tag;
+            }
+            catch { }
+        });
+        t.IsBackground = true;
+        t.Start();
+    }
+
     // ---- core: build calc, look up in DB, show dialog, return result ------
     static Dictionary<string, string> ProcessRequest(Dictionary<string, string> inp)
     {
         var outv = new Dictionary<string, string> { ["status"] = "error", ["found"] = "0", ["error"] = "" };
+        StartUpdateCheck();
         try
         {
             bool showDialog = GetInt(inp, "showDialog", 1) != 0;
@@ -393,6 +479,15 @@ static class Program
             outv["peck"] = Inv(res.Peck);
             outv["sfm"] = Inv(res.Real_SFM);
             outv["chipload"] = Inv(res.Real_IPT);
+
+            // Attach update info if a newer release was found.
+            string uv = _updateVersion;
+            if (uv != null)
+            {
+                outv["updateVersion"] = uv;
+                outv["currentVersion"] = CurrentVersion();
+                if (_updateUrl != null) outv["updateUrl"] = _updateUrl;
+            }
             return outv;
         }
         catch (Exception ex)
