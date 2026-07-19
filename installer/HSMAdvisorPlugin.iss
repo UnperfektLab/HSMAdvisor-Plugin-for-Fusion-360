@@ -4,7 +4,7 @@
 
 #define MyName "HSMAdvisor Plugin for Fusion 360"
 #define AddinName "HSMAdvisor Plugin"
-#define MyVersion "0.1.0"
+#define MyVersion "0.2.0"
 #define MyPublisher "UnperfektLab"
 #define MyUrl "https://github.com/UnperfektLab/HSMAdvisor-Plugin-for-Fusion-360"
 #define DistDir "..\dist\HSMAdvisor Plugin"

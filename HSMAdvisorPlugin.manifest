@@ -6,7 +6,7 @@
 		"":	"Unofficial plugin: brings HSMAdvisor feeds & speeds into Fusion 360. Requires a separately installed, licensed copy of HSMAdvisor."
 	},
 	"supportedOS":	"windows",
-	"version":	"0.1.0",
+	"version":	"0.2.0",
 	"editEnabled":	false,
 	"iconFilename":	"AddInIcon.svg",
 	"runOnStartup":	true,
