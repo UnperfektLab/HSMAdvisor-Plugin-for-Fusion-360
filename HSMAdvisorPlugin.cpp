@@ -438,6 +438,19 @@ static void maybeOfferUpdate(const std::map<std::string, std::string>& out)
     }
 }
 
+// Regenerates the toolpath for a single operation, so
+// the user doesn't have to regenerate by hand.
+static void regenerateOperation(const Ptr<Operation>& op)
+{
+    if (!op)
+        return;
+    Ptr<Document> doc = app ? app->activeDocument() : nullptr;
+    Ptr<Products> products = doc ? doc->products() : nullptr;
+    Ptr<CAM> cam = products ? products->itemByProductType("CAMProductType") : nullptr;
+    if (cam)
+        cam->generateToolpath(op);
+}
+
 // Writes the selected feeds & speeds into the operation. Assumes the result is valid
 // (status ok); the caller decides whether to invoke it.
 static void applyHostResult(const Ptr<Operation>& op, const std::map<std::string, std::string>& out)
@@ -544,15 +557,19 @@ static void applyHostResult(const Ptr<Operation>& op, const std::map<std::string
             msg << "WOC: " << woc * disp << " " << lenUnit
                 << (wocParam.empty() ? "  (no radial param on this strategy)" : "  -> " + wocParam) << "\n";
     }
-    msg << "\nRegenerate the toolpath to see the update.";
     if (!failed.empty())
     {
-        msg << "\n\nNote: could not set: ";
+        msg << "\nNote: could not set: ";
         for (size_t i = 0; i < failed.size(); ++i)
             msg << (i ? ", " : "") << failed[i];
     }
+    msg << "\n\nRegenerate the toolpath now?";
 
-    ui->messageBox(msg.str(), "HSMAdvisor Plugin");
+    // Yes = regenerate this operation's toolpath; No = dismiss
+    DialogResults regen = ui->messageBox(msg.str(), "HSMAdvisor Plugin",
+                                         YesNoButtonType, QuestionIconType);
+    if (regen == DialogYes)
+        regenerateOperation(op);
 
     // After the apply, surface any available plugin update (once per session).
     maybeOfferUpdate(out);
