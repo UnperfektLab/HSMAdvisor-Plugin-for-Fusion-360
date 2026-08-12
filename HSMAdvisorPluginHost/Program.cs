@@ -668,11 +668,19 @@ static class Program
 
         // Diameters go in straight from Fusion.
         // HSMAdvisor's single diameter field (backed by Diameter) is labelled "tip
-        // diameter", but for most types that label is really the tool diameter. 
+        // diameter", but for most types that label is really the tool diameter.
         // So feed Fusion's diameter by default, and use Fusion's tip diameter
         // only for the genuinely tapered types, where the tip is a distinct dimension.
         bool useTipDia = tt == Enums.ToolTypes.ChamferMill || tt == Enums.ToolTypes.VbitEngraver;
-        calc.Diameter = (useTipDia && tipDia > 0) ? tipDia : dia;
+        if (useTipDia)
+        {
+            // Pointed tools (V-bits) report a 0 tip diameter, but HSMAdvisor's tip-diameter
+            // field rejects 0. Set to a tiny positive value so it still reads as a point.
+            const double minTipMm = 0.001;
+            calc.Diameter = tipDia > minTipMm ? tipDia : minTipMm;
+        }
+        else
+            calc.Diameter = dia;
 
         
         if (has.HasFlag(G.TipDia))
