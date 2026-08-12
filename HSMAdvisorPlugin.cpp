@@ -17,6 +17,7 @@
 #include <vector>
 #include <map>
 #include <cstdlib>
+#include <cmath>
 #include <thread>
 
 #pragma comment(lib, "urlmon.lib")
@@ -95,6 +96,24 @@ static std::string readString(const Ptr<CAMParameters>& params, const std::strin
     if (!p) return "";
     Ptr<StringParameterValue> sv = p->value();
     return sv ? sv->value() : "";
+}
+
+// Flank half-angle (degrees, measured from the tool axis) used to convert a chamfer's
+// radial width to an axial depth.
+static double chamferHalfAngleDeg(const Ptr<CAMParameters>& toolParams)
+{
+    double taper = readAngleDeg(toolParams, "tool_taperAngle", 0.0);
+    double tip   = readAngleDeg(toolParams, "tool_tipAngle", 0.0);
+    if (taper > 0.0) return taper;
+    if (tip   > 0.0) return tip * 0.5;
+    return 45.0;
+}
+
+// tan(flank angle); 0 is treated as "no axial component" (guard div-by-zero).
+static double chamferTan(double halfDeg)
+{
+    const double kPi = 3.14159265358979323846;
+    return std::tan(halfDeg * kPi / 180.0);
 }
 
 // Sets a parameter's expression; records the name in `failed` if it doesn't stick.
@@ -509,10 +528,36 @@ static void applyHostResult(const Ptr<Operation>& op, const std::map<std::string
     // the user controls that), for drilling write peckingDepth from hsmadvisor peek value.
     std::string docParam, wocParam;
     bool peckWritten = false;
+    bool isChamfer = ops->itemByName("chamferWidth") != nullptr;
+    double chamferTipWritten = 0.0; // actual chamferTipOffset written (for the summary)
     if (ap_ad && isDrill)
     {
         if (peck > 0.0)
             peckWritten = (trySet(ops, "peckingDepth", numToStr(peck, 3) + "mm") == SetResult::Ok);
+    }
+    else if (isChamfer)
+    {
+        // Inverse of the seeding: WOC -> chamferWidth, DOC -> chamferTipOffset, where
+        // chamferTipOffset = DOC - chamferWidth / tan(flank angle). effWidth is the width
+        // in effect after this apply.
+        double t = chamferTan(chamferHalfAngleDeg(op->tool() ? op->tool()->parameters() : nullptr));
+        double effWidth = readLenMm(ops, "chamferWidth", 0.0);
+        if (ap_ae && woc > 0.0)
+        {
+            if (trySet(ops, "chamferWidth", numToStr(woc, 3) + "mm") == SetResult::Ok)
+                { wocParam = "chamferWidth"; effWidth = woc; }
+            else
+                failed.push_back("chamferWidth");
+        }
+        if (ap_ad && doc > 0.0)
+        {
+            double depth = (t > 1e-9) ? effWidth / t : 0.0;
+            chamferTipWritten = doc - depth;
+            if (trySet(ops, "chamferTipOffset", numToStr(chamferTipWritten, 3) + "mm") == SetResult::Ok)
+                docParam = "chamferTipOffset";
+            else
+                failed.push_back("chamferTipOffset");
+        }
     }
     else
     {
@@ -548,6 +593,18 @@ static void applyHostResult(const Ptr<Operation>& op, const std::map<std::string
     if (ap_ad && isDrill)
         msg << "Peck: " << peck * disp << " " << lenUnit
             << (peckWritten ? "  -> peckingDepth" : "  (no peck value)") << "\n";
+    else if (isChamfer)
+    {
+        if (ap_ae)
+            msg << "WOC: " << woc * disp << " " << lenUnit
+                << (wocParam.empty() ? "  (chamferWidth not set)" : "  -> chamferWidth") << "\n";
+        if (ap_ad)
+            msg << "DOC: " << doc * disp << " " << lenUnit
+                << (docParam.empty()
+                        ? "  (chamferTipOffset not set)"
+                        : "  -> chamferTipOffset " + numToStr(chamferTipWritten * disp, metric ? 3 : 4) + " " + lenUnit)
+                << "\n";
+    }
     else
     {
         if (ap_ad)
@@ -732,6 +789,21 @@ public:
         Ptr<CAMParameters> ops = op->parameters();
         double docIn = readLenMm(ops, "maximumStepdown", 0.0);
         double wocIn = readFirstLenMm(ops, {"optimalLoad", "maximumStepover", "stepover"});
+
+        // Chamfer operations don't expose stepdown/stepover, so seed them from the chamfer parameters instead:
+        //   WOC = chamfer width
+        //   DOC = tip offset + chamfer width / tan(flank angle)
+        // The flank angle is measured from the tool axis. Chamfer mills carry it as the
+        // taper angle; fall back to half the tip/included angle, else 45 deg.
+        double chamferWidth = readLenMm(ops, "chamferWidth", -1.0);
+        if (chamferWidth >= 0.0)
+        {
+            double tipOffset = readLenMm(ops, "chamferTipOffset", 0.0);
+            double t = chamferTan(chamferHalfAngleDeg(tp));
+            double chamferDepth = (t > 1e-9) ? chamferWidth / t : 0.0;
+            wocIn = chamferWidth;
+            docIn = tipOffset + chamferDepth;
+        }
 
         if (diameter <= 0.0)
         {
