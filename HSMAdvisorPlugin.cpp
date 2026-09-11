@@ -116,6 +116,30 @@ static double chamferTan(double halfDeg)
     return std::tan(halfDeg * kPi / 180.0);
 }
 
+// Recognizes a chamfer operation by strategy name or by tool type. This is used to decide whether to write chamferWidth/chamferTipOffset instead of maximumStepdown/maximumStepover.
+static bool isChamferEngagement(const Ptr<Operation>& op)
+{
+    if (!op) return false;
+
+    std::string strat = op->strategy();
+    for (char& c : strat) if (c >= 'A' && c <= 'Z') c += 32;
+
+    // 2D Chamfer operation (strategy id contains "chamfer").
+    if (strat.find("chamfer") != std::string::npos)
+        return true;
+
+    // 2D Contour with a chamfer tool.
+    if (strat.find("contour") != std::string::npos)
+    {
+        Ptr<Tool> tool = op->tool();
+        std::string toolType = readChoice(tool ? tool->parameters() : nullptr, "tool_type", "");
+        for (char& c : toolType) if (c >= 'A' && c <= 'Z') c += 32;
+        if (toolType.find("chamfer") != std::string::npos)
+            return true;
+    }
+    return false;
+}
+
 // Sets a parameter's expression; records the name in `failed` if it doesn't stick.
 static void writeExpr(const Ptr<CAMParameters>& params, const std::string& name,
                       const std::string& expr, std::vector<std::string>& failed)
@@ -528,7 +552,7 @@ static void applyHostResult(const Ptr<Operation>& op, const std::map<std::string
     // the user controls that), for drilling write peckingDepth from hsmadvisor peek value.
     std::string docParam, wocParam;
     bool peckWritten = false;
-    bool isChamfer = ops->itemByName("chamferWidth") != nullptr;
+    bool isChamfer = isChamferEngagement(op);
     double chamferTipWritten = 0.0; // actual chamferTipOffset written (for the summary)
     if (ap_ad && isDrill)
     {
@@ -790,14 +814,15 @@ public:
         double docIn = readLenMm(ops, "maximumStepdown", 0.0);
         double wocIn = readFirstLenMm(ops, {"optimalLoad", "maximumStepover", "stepover"});
 
-        // Chamfer operations don't expose stepdown/stepover, so seed them from the chamfer parameters instead:
+        // Chamfer engagements (2D Chamfer, or 2D Contour with a chamfer tool) don't use
+        // stepdown/stepover
         //   WOC = chamfer width
         //   DOC = tip offset + chamfer width / tan(flank angle)
         // The flank angle is measured from the tool axis. Chamfer mills carry it as the
         // taper angle; fall back to half the tip/included angle, else 45 deg.
-        double chamferWidth = readLenMm(ops, "chamferWidth", -1.0);
-        if (chamferWidth >= 0.0)
+        if (isChamferEngagement(op))
         {
+            double chamferWidth = readLenMm(ops, "chamferWidth", 0.0);
             double tipOffset = readLenMm(ops, "chamferTipOffset", 0.0);
             double t = chamferTan(chamferHalfAngleDeg(tp));
             double chamferDepth = (t > 1e-9) ? chamferWidth / t : 0.0;
