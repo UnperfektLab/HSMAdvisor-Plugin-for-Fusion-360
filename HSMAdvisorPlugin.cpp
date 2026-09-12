@@ -16,6 +16,7 @@
 #include <fstream>
 #include <vector>
 #include <map>
+#include <algorithm>
 #include <cstdlib>
 #include <cmath>
 #include <thread>
@@ -98,6 +99,13 @@ static std::string readString(const Ptr<CAMParameters>& params, const std::strin
     return sv ? sv->value() : "";
 }
 
+// Current expression of a parameter
+static std::string readExpr(const Ptr<CAMParameters>& params, const std::string& name)
+{
+    Ptr<CAMParameter> p = params ? params->itemByName(name) : nullptr;
+    return p ? p->expression() : std::string();
+}
+
 // Flank half-angle (degrees, measured from the tool axis) used to convert a chamfer's
 // radial width to an axial depth.
 static double chamferHalfAngleDeg(const Ptr<CAMParameters>& toolParams)
@@ -140,15 +148,6 @@ static bool isChamferEngagement(const Ptr<Operation>& op)
     return false;
 }
 
-// Sets a parameter's expression; records the name in `failed` if it doesn't stick.
-static void writeExpr(const Ptr<CAMParameters>& params, const std::string& name,
-                      const std::string& expr, std::vector<std::string>& failed)
-{
-    Ptr<CAMParameter> p = params ? params->itemByName(name) : nullptr;
-    if (!p || !p->expression(expr))
-        failed.push_back(name);
-}
-
 // Outcome of trying to set a parameter that may or may not exist on this strategy.
 enum class SetResult { NotPresent, Failed, Ok };
 
@@ -162,22 +161,34 @@ static SetResult trySet(const Ptr<CAMParameters>& params, const std::string& nam
     return p->expression(expr) ? SetResult::Ok : SetResult::Failed;
 }
 
-// Writes the first `candidates` parameter that exists on this strategy; returns its
-// name ("" if none). Engagement is named per strategy (adaptive: optimalLoad,
-// pocket: maximumStepover, ...), so it try them in order.
-static std::string setFirstExisting(const Ptr<CAMParameters>& params,
-                                     const std::vector<std::string>& candidates,
-                                     const std::string& expr,
-                                     std::vector<std::string>& failed)
+// True if the parameter exists on this operation.
+static bool hasParam(const Ptr<CAMParameters>& params, const std::string& name)
+{
+    return params && params->itemByName(name);
+}
+
+// First of `candidates` that exists on this operation ("" if none), without writing.
+static std::string firstExistingName(const Ptr<CAMParameters>& params,
+                                     const std::vector<std::string>& candidates)
 {
     for (const std::string& name : candidates)
-    {
-        SetResult r = trySet(params, name, expr);
-        if (r == SetResult::Ok) return name;
-        if (r == SetResult::Failed) { failed.push_back(name); return ""; }
-        // NotPresent -> try next candidate
-    }
+        if (hasParam(params, name)) return name;
     return "";
+}
+
+// Label for a CAM parameter id (falls back to the raw id).
+static std::string friendlyParamName(const std::string& raw)
+{
+    if (raw == "tool_spindleSpeed") return "Spindle speed";
+    if (raw == "tool_feedCutting")  return "Cutting feed";
+    if (raw == "tool_feedPlunge")   return "Plunge feed";
+    if (raw == "peckingDepth")      return "Peck depth";
+    if (raw == "maximumStepdown")   return "Depth of cut";
+    if (raw == "optimalLoad" || raw == "maximumStepover" || raw == "stepover")
+        return "Width of cut";
+    if (raw == "chamferWidth")      return "Chamfer width";
+    if (raw == "chamferTipOffset")  return "Chamfer tip offset";
+    return raw;
 }
 
 static std::string numToStr(double v, int decimals)
@@ -429,6 +440,23 @@ static std::map<std::string, std::string> g_pendingResult; // last host result, 
 static const char* kApplyCmdId = "HSMAdvisorApplyCmd";
 static Ptr<CommandDefinition> g_applyCmdDef;
 
+// A single results dialog: one table row per proposed change, each with its own
+// checkbox, showing the current (old) and proposed (new) value.
+struct PendingWrite { std::string name, expr; };  // parameter + expression to set
+struct PlanItem
+{
+    std::string cbId;        // checkbox input id for this row
+    std::string category;    // rpm / feed / ad / ae -- for the persisted default
+    std::string name;        // raw CAM parameter id (for old-value lookup + tooltip)
+    std::string label;       // name shown in the table
+    std::string oldv, newv;  // current / proposed value (display units)
+    std::vector<PendingWrite> writes; // what to write if this row is checked
+    bool defaultOn;          // initial checkbox state (from saved prefs)
+};
+static std::vector<PlanItem> g_plan;
+static std::vector<std::string> g_planNotes; // parameters that can't be set here
+static std::string g_planOpName;
+
 // If the host reported a newer release, offer a one-click update (once per session).
 static bool g_updateOffered = false;
 static void maybeOfferUpdate(const std::map<std::string, std::string>& out)
@@ -494,9 +522,8 @@ static void regenerateOperation(const Ptr<Operation>& op)
         cam->generateToolpath(op);
 }
 
-// Writes the selected feeds & speeds into the operation. Assumes the result is valid
-// (status ok); the caller decides whether to invoke it.
-static void applyHostResult(const Ptr<Operation>& op, const std::map<std::string, std::string>& out)
+// Builds the results-table preview (parameter, old, new) and the list of parameter writes to apply later.
+static void planHostResult(const Ptr<Operation>& op, const std::map<std::string, std::string>& out)
 {
     if (!op)
         return;
@@ -514,15 +541,8 @@ static void applyHostResult(const Ptr<Operation>& op, const std::map<std::string
         ui->messageBox("The operation is no longer available to update.", "HSMAdvisor Plugin");
         return;
     }
-    std::vector<std::string> failed;
 
-    // "all" is a master switch; otherwise apply only the individually-selected ones.
-    // (Plunge RPM / plunge feed are intentionally not written for now.)
-    bool ap_rpm  = g_apply.all || g_apply.rpm;
-    bool ap_feed = g_apply.all || g_apply.feed;
-    bool ap_ad   = g_apply.all || g_apply.ad;
-    bool ap_ae   = g_apply.all || g_apply.ae;
-
+    // Expressions to actually write (mm / rpm / mmpm unit tokens; Fusion converts them).
     std::string rpmExpr = numToStr((double)rpm, 0) + "rpm";
     std::string cutExpr = numToStr(feedCut, 1) + "mmpm";
 
@@ -530,134 +550,117 @@ static void applyHostResult(const Ptr<Operation>& op, const std::map<std::string
     std::string strat = op->strategy();
     for (char& c : strat) if (c >= 'A' && c <= 'Z') c += 32;
     bool isDrill = (strat == "drill");
+    bool isChamfer = isChamferEngagement(op);
+    const std::string feedParam = isDrill ? "tool_feedPlunge" : "tool_feedCutting";
 
-    if (ap_rpm)
-        writeExpr(ops, "tool_spindleSpeed", rpmExpr, failed);
-    if (ap_feed)
+    bool metric = readBool(ops, "metric", true);
+    double disp = metric ? 1.0 : 1.0 / 25.4;
+    const char* lenUnit  = metric ? "mm" : "in";
+    const char* feedUnit = metric ? "mm/min" : "in/min";
+    int lenPrec  = metric ? 3 : 4;
+    int feedPrec = metric ? 1 : 2;
+    auto lenNew  = [&](double mm)   { return numToStr(mm * disp, lenPrec) + " " + lenUnit; };
+
+    g_plan.clear();
+    g_planNotes.clear();
+    g_planOpName = op->name();
+
+    // Adds a checkbox row to the plan. defaultOn comes from the saved per-category prefs.
+    auto add = [&](const std::string& category, const std::string& name,
+                   const std::string& newDisplay, std::vector<PendingWrite> writes, bool defaultOn)
     {
+        PlanItem it;
+        it.cbId = "hsm_row" + std::to_string(g_plan.size());
+        it.category = category;
+        it.name = name;
+        it.label = friendlyParamName(name);
+        it.oldv = readExpr(ops, name);
+        it.newv = newDisplay;
+        it.writes = std::move(writes);
+        it.defaultOn = defaultOn;
+        g_plan.push_back(std::move(it));
+    };
+
+    if (rpm > 0 && hasParam(ops, "tool_spindleSpeed"))
+        add("rpm", "tool_spindleSpeed", numToStr((double)rpm, 0) + " rpm",
+            { { "tool_spindleSpeed", rpmExpr } }, g_apply.all || g_apply.rpm);
+
+    if (feedCut > 0.0 && hasParam(ops, feedParam))
+    {
+        // The row shows the primary feed parameter; for milling the same value also goes
+        // to entry/exit/transition.
+        std::vector<PendingWrite> w;
         if (isDrill)
-        {
-            writeExpr(ops, "tool_feedPlunge", cutExpr, failed);
-        }
+            w.push_back({ "tool_feedPlunge", cutExpr });
         else
-        {
-            writeExpr(ops, "tool_feedCutting", cutExpr, failed);
-            writeExpr(ops, "tool_feedEntry", cutExpr, failed);
-            writeExpr(ops, "tool_feedExit", cutExpr, failed);
-            writeExpr(ops, "tool_feedTransition", cutExpr, failed);
-        }
+            for (const char* fn : { "tool_feedCutting", "tool_feedEntry",
+                                    "tool_feedExit", "tool_feedTransition" })
+                w.push_back({ fn, cutExpr });
+        add("feed", feedParam, numToStr(feedCut * disp, feedPrec) + " " + feedUnit,
+            w, g_apply.all || g_apply.feed);
     }
 
-    // Depth of cut (ad): for milling write maximumStepdown (leaving doMultipleDepths alone,
-    // the user controls that), for drilling write peckingDepth from hsmadvisor peek value.
-    std::string docParam, wocParam;
-    bool peckWritten = false;
-    bool isChamfer = isChamferEngagement(op);
-    double chamferTipWritten = 0.0; // actual chamferTipOffset written (for the summary)
-    if (ap_ad && isDrill)
+    // Depth of cut: milling -> maximumStepdown; drilling -> peckingDepth; chamfer ->
+    // chamferTipOffset. Width of cut: milling -> optimalLoad/stepover; chamfer ->
+    // chamferWidth.
+    if (isDrill)
     {
         if (peck > 0.0)
-            peckWritten = (trySet(ops, "peckingDepth", numToStr(peck, 3) + "mm") == SetResult::Ok);
+        {
+            if (hasParam(ops, "peckingDepth"))
+                add("ad", "peckingDepth", lenNew(peck), { { "peckingDepth", numToStr(peck, 3) + "mm" } }, g_apply.all || g_apply.ad);
+            else
+                g_planNotes.push_back(friendlyParamName("peckingDepth") + " not set");
+        }
     }
     else if (isChamfer)
     {
         // Inverse of the seeding: WOC -> chamferWidth, DOC -> chamferTipOffset, where
         // chamferTipOffset = DOC - chamferWidth / tan(flank angle). effWidth is the width
-        // in effect after this apply.
+        // that will be in effect (the new WOC if it is written, else the current width).
         double t = chamferTan(chamferHalfAngleDeg(op->tool() ? op->tool()->parameters() : nullptr));
-        double effWidth = readLenMm(ops, "chamferWidth", 0.0);
-        if (ap_ae && woc > 0.0)
+        double effWidth = (woc > 0.0) ? woc : readLenMm(ops, "chamferWidth", 0.0);
+        if (woc > 0.0)
         {
-            if (trySet(ops, "chamferWidth", numToStr(woc, 3) + "mm") == SetResult::Ok)
-                { wocParam = "chamferWidth"; effWidth = woc; }
+            if (hasParam(ops, "chamferWidth"))
+                add("ae", "chamferWidth", lenNew(woc), { { "chamferWidth", numToStr(woc, 3) + "mm" } }, g_apply.all || g_apply.ae);
             else
-                failed.push_back("chamferWidth");
+                g_planNotes.push_back(friendlyParamName("chamferWidth") + " not set");
         }
-        if (ap_ad && doc > 0.0)
+        if (doc > 0.0)
         {
-            double depth = (t > 1e-9) ? effWidth / t : 0.0;
-            chamferTipWritten = doc - depth;
-            if (trySet(ops, "chamferTipOffset", numToStr(chamferTipWritten, 3) + "mm") == SetResult::Ok)
-                docParam = "chamferTipOffset";
-            else
-                failed.push_back("chamferTipOffset");
+            if (hasParam(ops, "chamferTipOffset"))
+            {
+                double depth = (t > 1e-9) ? effWidth / t : 0.0;
+                double tip = doc - depth;
+                add("ad", "chamferTipOffset", lenNew(tip), { { "chamferTipOffset", numToStr(tip, 3) + "mm" } }, g_apply.all || g_apply.ad);
+            }
+            else g_planNotes.push_back(friendlyParamName("chamferTipOffset") + " not set");
         }
     }
     else
     {
-        if (ap_ad && doc > 0.0)
+        if (doc > 0.0)
         {
-            if (trySet(ops, "maximumStepdown", numToStr(doc, 3) + "mm") == SetResult::Ok)
-                docParam = "maximumStepdown";
+            if (hasParam(ops, "maximumStepdown"))
+                add("ad", "maximumStepdown", lenNew(doc), { { "maximumStepdown", numToStr(doc, 3) + "mm" } }, g_apply.all || g_apply.ad);
             else
-                failed.push_back("maximumStepdown");
+                g_planNotes.push_back("no depth param on this strategy");
         }
-        // WOC (ae): parameter name varies by strategy, try each in turn. (temporary solution)
-        if (ap_ae && woc > 0.0)
-            wocParam = setFirstExisting(
-                ops, {"optimalLoad", "maximumStepover", "stepover"},
-                numToStr(woc, 3) + "mm", failed);
+        if (woc > 0.0)
+        {
+            std::string wp = firstExistingName(ops, { "optimalLoad", "maximumStepover", "stepover" });
+            if (!wp.empty())
+                add("ae", wp, lenNew(woc), { { wp, numToStr(woc, 3) + "mm" } }, g_apply.all || g_apply.ae);
+            else
+                g_planNotes.push_back("no radial param on this strategy");
+        }
     }
-
-    // Values are always written in mm (Fusion converts them via the unit tokens), but the
-    // summary is shown in the document's own units so it matches what the user sees.
-    bool metric = readBool(ops, "metric", true);
-    double disp = metric ? 1.0 : 1.0 / 25.4;
-    const char* lenUnit  = metric ? "mm" : "in";
-    const char* feedUnit = metric ? "mm/min" : "in/min";
-
-    std::ostringstream msg;
-    msg.setf(std::ios::fixed);
-    msg << "Applied to '" << op->name() << "':\n\n";
-    msg.precision(0);
-    if (ap_rpm)  msg << "Spindle:  " << (double)rpm << " rpm\n";
-    msg.precision(metric ? 1 : 2);
-    if (ap_feed) msg << (isDrill ? "Plunge:  " : "Cutting:  ") << feedCut * disp << " " << feedUnit << "\n";
-    msg.precision(metric ? 3 : 4);
-    if (ap_ad && isDrill)
-        msg << "Peck: " << peck * disp << " " << lenUnit
-            << (peckWritten ? "  -> peckingDepth" : "  (no peck value)") << "\n";
-    else if (isChamfer)
-    {
-        if (ap_ae)
-            msg << "WOC: " << woc * disp << " " << lenUnit
-                << (wocParam.empty() ? "  (chamferWidth not set)" : "  -> chamferWidth") << "\n";
-        if (ap_ad)
-            msg << "DOC: " << doc * disp << " " << lenUnit
-                << (docParam.empty()
-                        ? "  (chamferTipOffset not set)"
-                        : "  -> chamferTipOffset " + numToStr(chamferTipWritten * disp, metric ? 3 : 4) + " " + lenUnit)
-                << "\n";
-    }
-    else
-    {
-        if (ap_ad)
-            msg << "DOC: " << doc * disp << " " << lenUnit
-                << (docParam.empty() ? "  (no depth param on this strategy)" : "  -> " + docParam) << "\n";
-        if (ap_ae)
-            msg << "WOC: " << woc * disp << " " << lenUnit
-                << (wocParam.empty() ? "  (no radial param on this strategy)" : "  -> " + wocParam) << "\n";
-    }
-    if (!failed.empty())
-    {
-        msg << "\nNote: could not set: ";
-        for (size_t i = 0; i < failed.size(); ++i)
-            msg << (i ? ", " : "") << failed[i];
-    }
-    msg << "\n\nRegenerate the toolpath now?";
-
-    // Yes = regenerate this operation's toolpath; No = dismiss
-    DialogResults regen = ui->messageBox(msg.str(), "HSMAdvisor Plugin",
-                                         YesNoButtonType, QuestionIconType);
-    if (regen == DialogYes)
-        regenerateOperation(op);
-
-    // After the apply, surface any available plugin update (once per session).
-    maybeOfferUpdate(out);
 }
 
-// Fired when the host has returned a result. On success it opensthe "what to apply" chooser
-// (g_hostBusy stays true until the chooser is destroyed).
+// Fired when the host has returned a result. On success it plans the changes and opens
+// the single results dialog (checkbox + old + new per parameter). g_hostBusy stays true
+// until that dialog is destroyed.
 class HostDoneHandler : public CustomEventHandler
 {
 public:
@@ -670,10 +673,21 @@ public:
         if (status == "ok")
         {
             g_pendingResult = out;
-            if (g_applyCmdDef)
-                g_applyCmdDef->execute(); // show the chooser
+            planHostResult(g_pendingOp, out);
+
+            if ((!g_plan.empty() || !g_planNotes.empty()) && g_applyCmdDef)
+            {
+                g_applyCmdDef->execute(); // show the single results dialog
+            }
             else
-                { applyHostResult(g_pendingOp, out); g_pendingOp = nullptr; g_hostBusy = false; }
+            {
+                if (g_plan.empty() && g_planNotes.empty())
+                    ui->messageBox("HSMAdvisor returned no values that apply to this operation.",
+                                   "HSMAdvisor Plugin");
+                g_pendingOp = nullptr;
+                g_pendingResult.clear();
+                g_hostBusy = false;
+            }
         }
         else
         {
@@ -687,68 +701,145 @@ public:
 };
 static HostDoneHandler g_onHostDone;
 
-// --- "what to apply" chooser command (shown after HSMAdvisor returns) --------
-class ChooserExecuteHandler : public CommandEventHandler
+// --- single results dialog: a checkbox + old + new per parameter -------------
+class ApplyExecuteHandler : public CommandEventHandler
 {
 public:
     void notify(const Ptr<CommandEventArgs>& eventArgs) override
     {
         Ptr<Command> cmd = eventArgs ? eventArgs->command() : nullptr;
         Ptr<CommandInputs> inputs = cmd ? cmd->commandInputs() : nullptr;
-        if (inputs)
+        if (!inputs) return;
+
+        Ptr<CAMParameters> ops = g_pendingOp ? g_pendingOp->parameters() : nullptr;
+        std::vector<std::string> failed;
+
+        for (const PlanItem& item : g_plan)
         {
-            auto gb = [&](const char* id, bool def)
-            {
-                Ptr<BoolValueCommandInput> b = inputs->itemById(id);
-                return b ? b->value() : def;
-            };
-            g_apply.all  = gb("hsm_all", g_apply.all);
-            g_apply.rpm  = gb("hsm_rpm", g_apply.rpm);
-            g_apply.feed = gb("hsm_feed", g_apply.feed);
-            g_apply.ad   = gb("hsm_ad", g_apply.ad);
-            g_apply.ae   = gb("hsm_ae", g_apply.ae);
-            saveApplyPrefs();
+            Ptr<BoolValueCommandInput> cb = inputs->itemById(item.cbId);
+            bool on = cb ? cb->value() : item.defaultOn;
+
+            // Remember the choice per category so the next run defaults the same way.
+            if      (item.category == "rpm")  g_apply.rpm  = on;
+            else if (item.category == "feed") g_apply.feed = on;
+            else if (item.category == "ad")   g_apply.ad   = on;
+            else if (item.category == "ae")   g_apply.ae   = on;
+
+            if (on && ops)
+                for (const PendingWrite& w : item.writes)
+                    if (trySet(ops, w.name, w.expr) == SetResult::Failed)
+                        failed.push_back(w.name);
         }
-        applyHostResult(g_pendingOp, g_pendingResult);
+        g_apply.all = false; // per-row checkboxes replace the old master switch
+        saveApplyPrefs();
+
+        if (!failed.empty())
+        {
+            std::string m = "Could not set: ";
+            for (size_t i = 0; i < failed.size(); ++i)
+                m += (i ? ", " : "") + friendlyParamName(failed[i]);
+            ui->messageBox(m, "HSMAdvisor Plugin");
+        }
+
+        Ptr<BoolValueCommandInput> regen = inputs->itemById("hsm_regen");
+        if (!regen || regen->value())
+            regenerateOperation(g_pendingOp);
+
+        // Surface any available plugin update (once per session).
+        maybeOfferUpdate(g_pendingResult);
     }
 };
-static ChooserExecuteHandler g_onChooserExecute;
+static ApplyExecuteHandler g_onApplyExecute;
 
-// Fires on both OK and Cancel of the chooser, always clears the busy state.
-class ChooserDestroyHandler : public CommandEventHandler
+// Fires on OK and Cancel; always clears the shared state.
+class ApplyDestroyHandler : public CommandEventHandler
 {
 public:
     void notify(const Ptr<CommandEventArgs>& /*args*/) override
     {
         g_pendingOp = nullptr;
         g_pendingResult.clear();
+        g_plan.clear();
+        g_planNotes.clear();
+        g_planOpName.clear();
         g_hostBusy = false;
     }
 };
-static ChooserDestroyHandler g_onChooserDestroy;
+static ApplyDestroyHandler g_onApplyDestroy;
 
-class ChooserCreatedHandler : public CommandCreatedEventHandler
+class ApplyCreatedHandler : public CommandCreatedEventHandler
 {
 public:
     void notify(const Ptr<CommandCreatedEventArgs>& eventArgs) override
     {
         Ptr<Command> cmd = eventArgs->command();
         if (!cmd) return;
-        cmd->execute()->add(&g_onChooserExecute);
-        cmd->destroy()->add(&g_onChooserDestroy);
+        cmd->execute()->add(&g_onApplyExecute);
+        cmd->destroy()->add(&g_onApplyDestroy);
 
         Ptr<CommandInputs> inputs = cmd->commandInputs();
-        if (inputs)
+        if (!inputs) return;
+
+        Ptr<TextBoxCommandInput> title = inputs->addTextBoxCommandInput(
+            "hsm_title", "", "<b>Apply to '" + g_planOpName + "'</b>", 1, true);
+        if (title) title->isFullWidth(true);
+
+        // Table: [checkbox] | Parameter | Old | New
+        Ptr<TableCommandInput> table =
+            inputs->addTableCommandInput("hsm_table", "", 4, "1:4:3:3");
+        if (table)
         {
-            inputs->addBoolValueInput("hsm_all",  "Apply all",         true, "", g_apply.all);
-            inputs->addBoolValueInput("hsm_rpm",  "Spindle RPM",       true, "", g_apply.rpm);
-            inputs->addBoolValueInput("hsm_feed", "Feedrate",          true, "", g_apply.feed);
-            inputs->addBoolValueInput("hsm_ad",   "Depth of cut (ad)", true, "", g_apply.ad);
-            inputs->addBoolValueInput("hsm_ae",   "Width of cut (ae)", true, "", g_apply.ae);
+            table->hasGrid(true);
+            table->isFullWidth(true);
+            int visRows = (int)g_plan.size() + 1; // + header
+            table->minimumVisibleRows(visRows);
+            table->maximumVisibleRows(visRows);
+
+            auto textCell = [&](const std::string& id, const std::string& text,
+                                int row, int col, bool header, const std::string& tip = "")
+            {
+                std::string t = header ? ("<b>" + text + "</b>") : text;
+                Ptr<TextBoxCommandInput> tb = inputs->addTextBoxCommandInput(id, "", t, 1, true);
+                if (tb)
+                {
+                    if (!tip.empty()) tb->tooltip(tip);
+                    table->addCommandInput(tb, row, col);
+                }
+            };
+
+            textCell("hsm_h0", "",          0, 0, true);
+            textCell("hsm_h1", "Parameter", 0, 1, true);
+            textCell("hsm_h2", "Old",       0, 2, true);
+            textCell("hsm_h3", "New",       0, 3, true);
+
+            for (size_t i = 0; i < g_plan.size(); ++i)
+            {
+                const PlanItem& it = g_plan[i];
+                int r = (int)i + 1;
+                Ptr<BoolValueCommandInput> cb =
+                    inputs->addBoolValueInput(it.cbId, "", true, "", it.defaultOn);
+                if (cb) table->addCommandInput(cb, r, 0);
+                std::string pfx = "hsm_c" + std::to_string(i);
+                textCell(pfx + "n", it.label, r, 1, false, it.name); // hover shows raw id
+                textCell(pfx + "o", it.oldv, r, 2, false);
+                textCell(pfx + "w", it.newv, r, 3, false);
+            }
         }
+
+        if (!g_planNotes.empty())
+        {
+            std::string notes = "Not available on this operation: ";
+            for (size_t i = 0; i < g_planNotes.size(); ++i)
+                notes += (i ? "; " : "") + g_planNotes[i];
+            Ptr<TextBoxCommandInput> nb = inputs->addTextBoxCommandInput(
+                "hsm_notes", "", notes, 1, true);
+            if (nb) nb->isFullWidth(true);
+        }
+
+        inputs->addBoolValueInput("hsm_regen", "Regenerate toolpath", true, "", true);
     }
 };
-static ChooserCreatedHandler g_onChooserCreated;
+static ApplyCreatedHandler g_onApplyCreated;
 
 // Main flow: read the selected operation's tool geometry, then launch the HSMAdvisor
 // dialog host without blocking Fusion. The result is applied later, when the host
@@ -924,14 +1015,15 @@ extern "C" XI_EXPORT bool run(const char* context)
 
     cmdDef->commandCreated()->add(&g_onCommandCreated);
 
-    // Command that shows the "what to apply" chooser after HSMAdvisor returns.
+    // The single results dialog shown after HSMAdvisor returns: a checkbox + old + new
+    // per parameter; OK writes the checked rows.
     g_applyCmdDef = cmdDefs->itemById(kApplyCmdId);
     if (!g_applyCmdDef)
         g_applyCmdDef = cmdDefs->addButtonDefinition(
             kApplyCmdId, "Apply HSMAdvisor result",
             "Choose which calculated values to apply to the operation.");
     if (g_applyCmdDef)
-        g_applyCmdDef->commandCreated()->add(&g_onChooserCreated);
+        g_applyCmdDef->commandCreated()->add(&g_onApplyCreated);
 
     // Place the button in the Manage panel.
     Ptr<Workspaces> workspaces = ui->workspaces();
