@@ -106,6 +106,16 @@ static std::string readExpr(const Ptr<CAMParameters>& params, const std::string&
     return p ? p->expression() : std::string();
 }
 
+// Evaluated numeric value of a float parameter (internal units). false if absent.
+static bool readFloatVal(const Ptr<CAMParameters>& params, const std::string& name, double& out)
+{
+    Ptr<CAMParameter> p = params ? params->itemByName(name) : nullptr;
+    Ptr<FloatParameterValue> fv = p ? p->value() : nullptr;
+    if (!fv) return false;
+    out = fv->value();
+    return true;
+}
+
 // Flank half-angle (degrees, measured from the tool axis) used to convert a chamfer's
 // radial width to an axial depth.
 static double chamferHalfAngleDeg(const Ptr<CAMParameters>& toolParams)
@@ -182,6 +192,7 @@ static std::string friendlyParamName(const std::string& raw)
     if (raw == "tool_spindleSpeed") return "Spindle speed";
     if (raw == "tool_feedCutting")  return "Cutting feed";
     if (raw == "tool_feedPlunge")   return "Plunge feed";
+    if (raw == "tool_feedRamp")     return "Ramp feed";
     if (raw == "peckingDepth")      return "Peck depth";
     if (raw == "maximumStepdown")   return "Depth of cut";
     if (raw == "optimalLoad" || raw == "maximumStepover" || raw == "stepover")
@@ -231,8 +242,8 @@ static const std::string& addinFolder()
 
 // Which results the user wants written back. Persisted
 // between sessions in apply_prefs.txt.
-struct ApplySel { bool all, ad, ae, rpm, feed, plungeRpm, plungeFeed; };
-static ApplySel g_apply = { true, true, true, true, true, true, true };
+struct ApplySel { bool all, ad, ae, rpm, feed, plungeRpm, plungeFeed, ramp; };
+static ApplySel g_apply = { true, true, true, true, true, true, true, true };
 
 static std::string prefsPath() { return addinFolder() + "\\apply_prefs.txt"; }
 
@@ -274,6 +285,7 @@ static void loadApplyPrefs()
     g_apply.feed       = gb("feed", true);
     g_apply.plungeRpm  = gb("plungeRpm", true);
     g_apply.plungeFeed = gb("plungeFeed", true);
+    g_apply.ramp       = gb("ramp", true);
 }
 
 static void saveApplyPrefs()
@@ -286,7 +298,8 @@ static void saveApplyPrefs()
       << "rpm=" << (g_apply.rpm ? 1 : 0) << "\n"
       << "feed=" << (g_apply.feed ? 1 : 0) << "\n"
       << "plungeRpm=" << (g_apply.plungeRpm ? 1 : 0) << "\n"
-      << "plungeFeed=" << (g_apply.plungeFeed ? 1 : 0) << "\n";
+      << "plungeFeed=" << (g_apply.plungeFeed ? 1 : 0) << "\n"
+      << "ramp=" << (g_apply.ramp ? 1 : 0) << "\n";
 }
 
 static const char*    kHostDoneEventId = "HSMAdvisorHostDoneEvent";
@@ -450,6 +463,7 @@ struct PlanItem
     std::string name;        // raw CAM parameter id (for old-value lookup + tooltip)
     std::string label;       // name shown in the table
     std::string oldv, newv;  // current / proposed value (display units)
+    std::string oldExpr;     // current expression/variable (tooltip for the Old cell)
     std::vector<PendingWrite> writes; // what to write if this row is checked
     bool defaultOn;          // initial checkbox state (from saved prefs)
 };
@@ -528,12 +542,13 @@ static void planHostResult(const Ptr<Operation>& op, const std::map<std::string,
     if (!op)
         return;
 
-    // Plunge RPM/feed and SFM are returned by the host but intentionally not applied for now.
-    int    rpm     = (int)strtod(kvGet(out, "rpm", "0").c_str(), nullptr);
-    double feedCut = strtod(kvGet(out, "feedCut", "0").c_str(), nullptr);
-    double doc     = strtod(kvGet(out, "doc", "0").c_str(), nullptr);
-    double woc     = strtod(kvGet(out, "woc", "0").c_str(), nullptr);
-    double peck    = strtod(kvGet(out, "peck", "0").c_str(), nullptr);
+    // Plunge RPM and SFM are returned by the host but intentionally not applied for now.
+    int    rpm        = (int)strtod(kvGet(out, "rpm", "0").c_str(), nullptr);
+    double feedCut    = strtod(kvGet(out, "feedCut", "0").c_str(), nullptr);
+    double feedPlunge = strtod(kvGet(out, "feedPlunge", "0").c_str(), nullptr);
+    double doc        = strtod(kvGet(out, "doc", "0").c_str(), nullptr);
+    double woc        = strtod(kvGet(out, "woc", "0").c_str(), nullptr);
+    double peck       = strtod(kvGet(out, "peck", "0").c_str(), nullptr);
 
     Ptr<CAMParameters> ops = op->parameters();
     if (!ops)
@@ -565,7 +580,20 @@ static void planHostResult(const Ptr<Operation>& op, const std::map<std::string,
     g_planNotes.clear();
     g_planOpName = op->name();
 
+    // Current value for the Old column: always the evaluated result value(), formatted in
+    // the document's display units (the raw expression/variable goes in the cell tooltip).
+    auto oldDisplay = [&](const std::string& category, const std::string& name) -> std::string
+    {
+        double val;
+        if (!readFloatVal(ops, name, val)) return readExpr(ops, name); // no numeric value
+        if (category == "rpm") return numToStr(val, 0) + " rpm";
+        bool isFeed = (category == "feed" || category == "plungeFeed" || category == "ramp");
+        double display = isFeed ? (val * disp) : (val * 10.0 * disp);
+        return numToStr(display, isFeed ? feedPrec : lenPrec) + " " + (isFeed ? feedUnit : lenUnit);
+    };
+
     // Adds a checkbox row to the plan. defaultOn comes from the saved per-category prefs.
+    // oldExpr keeps the raw expression/variable for the Old cell's tooltip.
     auto add = [&](const std::string& category, const std::string& name,
                    const std::string& newDisplay, std::vector<PendingWrite> writes, bool defaultOn)
     {
@@ -574,7 +602,8 @@ static void planHostResult(const Ptr<Operation>& op, const std::map<std::string,
         it.category = category;
         it.name = name;
         it.label = friendlyParamName(name);
-        it.oldv = readExpr(ops, name);
+        it.oldv = oldDisplay(category, name);
+        it.oldExpr = readExpr(ops, name);
         it.newv = newDisplay;
         it.writes = std::move(writes);
         it.defaultOn = defaultOn;
@@ -598,6 +627,19 @@ static void planHostResult(const Ptr<Operation>& op, const std::map<std::string,
                 w.push_back({ fn, cutExpr });
         add("feed", feedParam, numToStr(feedCut * disp, feedPrec) + " " + feedUnit,
             w, g_apply.all || g_apply.feed);
+    }
+
+    // Plunge feed (HSMAdvisor FEED_Plunge) -> Fusion plunge & ramp feeds.
+    if (!isDrill && feedPlunge > 0.0)
+    {
+        std::string plungeExpr = numToStr(feedPlunge, 1) + "mmpm";
+        std::string plungeDisp = numToStr(feedPlunge * disp, feedPrec) + " " + feedUnit;
+        if (hasParam(ops, "tool_feedPlunge"))
+            add("plungeFeed", "tool_feedPlunge", plungeDisp,
+                { { "tool_feedPlunge", plungeExpr } }, g_apply.all || g_apply.plungeFeed);
+        if (hasParam(ops, "tool_feedRamp"))
+            add("ramp", "tool_feedRamp", plungeDisp,
+                { { "tool_feedRamp", plungeExpr } }, g_apply.all || g_apply.ramp);
     }
 
     // Depth of cut: milling -> maximumStepdown; drilling -> peckingDepth; chamfer ->
@@ -720,10 +762,12 @@ public:
             bool on = cb ? cb->value() : item.defaultOn;
 
             // Remember the choice per category so the next run defaults the same way.
-            if      (item.category == "rpm")  g_apply.rpm  = on;
-            else if (item.category == "feed") g_apply.feed = on;
-            else if (item.category == "ad")   g_apply.ad   = on;
-            else if (item.category == "ae")   g_apply.ae   = on;
+            if      (item.category == "rpm")        g_apply.rpm        = on;
+            else if (item.category == "feed")       g_apply.feed       = on;
+            else if (item.category == "plungeFeed") g_apply.plungeFeed = on;
+            else if (item.category == "ramp")       g_apply.ramp       = on;
+            else if (item.category == "ad")         g_apply.ad         = on;
+            else if (item.category == "ae")         g_apply.ae         = on;
 
             if (on && ops)
                 for (const PendingWrite& w : item.writes)
@@ -820,8 +864,8 @@ public:
                     inputs->addBoolValueInput(it.cbId, "", true, "", it.defaultOn);
                 if (cb) table->addCommandInput(cb, r, 0);
                 std::string pfx = "hsm_c" + std::to_string(i);
-                textCell(pfx + "n", it.label, r, 1, false, it.name); // hover shows raw id
-                textCell(pfx + "o", it.oldv, r, 2, false);
+                textCell(pfx + "n", it.label, r, 1, false, it.name);    // hover: raw id
+                textCell(pfx + "o", it.oldv, r, 2, false, it.oldExpr);  // hover: expression
                 textCell(pfx + "w", it.newv, r, 3, false);
             }
         }
