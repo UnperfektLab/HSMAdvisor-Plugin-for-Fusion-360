@@ -167,6 +167,9 @@ static SetResult trySet(const Ptr<CAMParameters>& params, const std::string& nam
 {
     Ptr<CAMParameter> p = params ? params->itemByName(name) : nullptr;
     if (!p) return SetResult::NotPresent;
+    
+    Ptr<ChoiceParameterValue> cv = p->value();
+    if (cv) return cv->value(expr) ? SetResult::Ok : SetResult::Failed;
     return p->expression(expr) ? SetResult::Ok : SetResult::Failed;
 }
 
@@ -199,6 +202,8 @@ static std::string friendlyParamName(const std::string& raw)
         return "Width of cut";
     if (raw == "chamferWidth")      return "Chamfer width";
     if (raw == "chamferTipOffset")  return "Chamfer tip offset";
+    if (raw == "rampType")          return "Ramp type";
+    if (raw == "rampAngle")         return "Ramp angle";
     return raw;
 }
 
@@ -242,8 +247,8 @@ static const std::string& addinFolder()
 
 // Which results the user wants written back. Persisted
 // between sessions in apply_prefs.txt.
-struct ApplySel { bool all, ad, ae, rpm, feed, plungeRpm, plungeFeed, ramp; };
-static ApplySel g_apply = { true, true, true, true, true, true, true, true };
+struct ApplySel { bool all, ad, ae, rpm, feed, plungeRpm, plungeFeed, ramp, rampType, rampAngle; };
+static ApplySel g_apply = { true, true, true, true, true, true, true, true, true, true };
 
 static std::string prefsPath() { return addinFolder() + "\\apply_prefs.txt"; }
 
@@ -286,6 +291,8 @@ static void loadApplyPrefs()
     g_apply.plungeRpm  = gb("plungeRpm", true);
     g_apply.plungeFeed = gb("plungeFeed", true);
     g_apply.ramp       = gb("ramp", true);
+    g_apply.rampType   = gb("rampType", true);
+    g_apply.rampAngle  = gb("rampAngle", true);
 }
 
 static void saveApplyPrefs()
@@ -299,7 +306,9 @@ static void saveApplyPrefs()
       << "feed=" << (g_apply.feed ? 1 : 0) << "\n"
       << "plungeRpm=" << (g_apply.plungeRpm ? 1 : 0) << "\n"
       << "plungeFeed=" << (g_apply.plungeFeed ? 1 : 0) << "\n"
-      << "ramp=" << (g_apply.ramp ? 1 : 0) << "\n";
+      << "ramp=" << (g_apply.ramp ? 1 : 0) << "\n"
+      << "rampType=" << (g_apply.rampType ? 1 : 0) << "\n"
+      << "rampAngle=" << (g_apply.rampAngle ? 1 : 0) << "\n";
 }
 
 static const char*    kHostDoneEventId = "HSMAdvisorHostDoneEvent";
@@ -550,6 +559,7 @@ static void planHostResult(const Ptr<Operation>& op, const std::map<std::string,
     double doc        = strtod(kvGet(out, "doc", "0").c_str(), nullptr);
     double woc        = strtod(kvGet(out, "woc", "0").c_str(), nullptr);
     double peck       = strtod(kvGet(out, "peck", "0").c_str(), nullptr);
+    double rampOut    = strtod(kvGet(out, "rampAngleOut", "0").c_str(), nullptr); // HSM ramp angle
 
     Ptr<CAMParameters> ops = op->parameters();
     if (!ops)
@@ -583,9 +593,11 @@ static void planHostResult(const Ptr<Operation>& op, const std::map<std::string,
     // the document's display units (the raw expression/variable goes in the cell tooltip).
     auto oldDisplay = [&](const std::string& category, const std::string& name) -> std::string
     {
+        if (category == "rampType") return readChoice(ops, name, readExpr(ops, name));
         double val;
         if (!readFloatVal(ops, name, val)) return readExpr(ops, name); // no numeric value
         if (category == "rpm" || category == "plungeRpm") return numToStr(val, 0) + " rpm";
+        if (category == "rampAngle") return numToStr(val, 3) + " deg"; // val already in degrees
         bool isFeed = (category == "feed" || category == "plungeFeed" || category == "ramp");
         double display = isFeed ? (val * disp) : (val * 10.0 * disp);
         return numToStr(display, isFeed ? feedPrec : lenPrec) + " " + (isFeed ? feedUnit : lenUnit);
@@ -648,6 +660,14 @@ static void planHostResult(const Ptr<Operation>& op, const std::map<std::string,
         add("plungeRpm", "tool_rampSpindleSpeed", rpmPlungeExpr + " rpm",
             { { "tool_rampSpindleSpeed", rpmPlungeExpr + "rpm" } }, g_apply.all || g_apply.plungeRpm);
     }
+
+    // Switch the operation to a helix ramp and push HSMAdvisor's ramp angle (res.Ramp) into Fusion.
+    if (hasParam(ops, "rampType"))
+        add("rampType", "rampType", "helix", { { "rampType", "helix" } },
+            g_apply.all || g_apply.rampType);
+    if (rampOut > 0.0 && hasParam(ops, "rampAngle"))
+        add("rampAngle", "rampAngle", numToStr(rampOut, 3) + " deg",
+            { { "rampAngle", numToStr(rampOut, 3) + "deg" } }, g_apply.all || g_apply.rampAngle);
 
     // Depth of cut: milling -> maximumStepdown; drilling -> peckingDepth; chamfer ->
     // chamferTipOffset. Width of cut: milling -> optimalLoad/stepover; chamfer ->
@@ -774,6 +794,8 @@ public:
             else if (item.category == "feed")       g_apply.feed       = on;
             else if (item.category == "plungeFeed") g_apply.plungeFeed = on;
             else if (item.category == "ramp")       g_apply.ramp       = on;
+            else if (item.category == "rampType")   g_apply.rampType   = on;
+            else if (item.category == "rampAngle")  g_apply.rampAngle  = on;
             else if (item.category == "ad")         g_apply.ad         = on;
             else if (item.category == "ae")         g_apply.ae         = on;
 
@@ -957,6 +979,10 @@ public:
         double docIn = readLenMm(ops, "maximumStepdown", 0.0);
         double wocIn = readFirstLenMm(ops, {"optimalLoad", "maximumStepover", "stepover"});
 
+        // Ramp angle (deg) -> HSMAdvisor ramp-angle plunge calculation.
+        double rampAngle = readAngleDeg(ops, "rampAngle", 0.0);
+        bool isHelixRamp = toLower(readChoice(ops, "rampType", "")) == "helix";
+
         // Chamfer engagements (2D Chamfer, or 2D Contour with a chamfer tool) don't use
         // stepdown/stepover
         //   WOC = chamfer width
@@ -1001,7 +1027,9 @@ public:
             << "shaftDiameter=" << numToStr(shaftDia, 4) << "\n"
             << "stickout=" << numToStr(stickout, 4) << "\n"
             << "docIn=" << numToStr(docIn, 4) << "\n"
-            << "wocIn=" << numToStr(wocIn, 4) << "\n";
+            << "wocIn=" << numToStr(wocIn, 4) << "\n"
+            << "rampAngle=" << numToStr(rampAngle, 4) << "\n"
+            << "rampHelix=" << (isHelixRamp ? 1 : 0) << "\n";
 
         g_pendingOp = op;
         g_hostBusy = true;

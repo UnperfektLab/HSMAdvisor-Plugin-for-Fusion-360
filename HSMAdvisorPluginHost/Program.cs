@@ -404,7 +404,9 @@ static class Program
                    ta = GetD(inp, "taperAngle", 0), tipAng = GetD(inp, "tipAngle", 0),
                    sdia = GetD(inp, "shoulderDiameter", 0), pitch = GetD(inp, "threadPitch", 0),
                    stickout = GetD(inp, "stickout", 0),
-                   docIn = GetD(inp, "docIn", 0), wocIn = GetD(inp, "wocIn", 0);
+                   docIn = GetD(inp, "docIn", 0), wocIn = GetD(inp, "wocIn", 0),
+                   rampAngle = GetD(inp, "rampAngle", 0);
+            bool rampHelix = GetInt(inp, "rampHelix", 0) != 0;
             int flutes = GetInt(inp, "flutes", 0);
 
             // Build the tool fresh (geometry from Fusion, or the DB tool).
@@ -433,6 +435,15 @@ static class Program
             // Seed HSMAdvisor's cut engagement from the operation's
             if (docIn > 0) try { calc.DOC = docIn; } catch { }
             if (wocIn > 0) try { calc.WOC = wocIn; } catch { }
+
+            // Seed the ramp angle (deg) from the Fusion operation.
+            if (rampAngle > 0) try { calc.Ramp = rampAngle; } catch { }
+            if (rampHelix)
+            {
+                try { calc.RampMilling = false; } catch { }
+                try { calc.Circle_Comp = true; } catch { }
+                try { calc.Calculate(false); } catch { }
+            }
 
             // Restore the unit mode the user last left the dialog.
             try { calc.SetMetric(ReadRememberedMetric()); } catch { }
@@ -479,6 +490,7 @@ static class Program
             outv["peck"] = Inv(res.Peck);
             outv["sfm"] = Inv(res.Real_SFM);
             outv["chipload"] = Inv(res.Real_IPT);
+            try { outv["rampAngleOut"] = Inv(res.Ramp); } catch { }
 
             // Attach update info if a newer release was found.
             string uv = _updateVersion;
