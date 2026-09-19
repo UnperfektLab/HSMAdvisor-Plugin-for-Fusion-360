@@ -4,7 +4,11 @@
 
 #define MyName "HSMAdvisor Plugin for Fusion 360"
 #define AddinName "HSMAdvisor Plugin"
-#define MyVersion "0.3.0"
+; Version is single-sourced from the add-in manifest and passed by build.ps1 as
+; /DMyVersion=<ver>. This fallback only applies when ISCC is run standalone.
+#ifndef MyVersion
+  #define MyVersion "0.0.0"
+#endif
 #define MyPublisher "UnperfektLab"
 #define MyUrl "https://github.com/UnperfektLab/HSMAdvisor-Plugin-for-Fusion-360"
 #define DistDir "..\dist\HSMAdvisor Plugin"

@@ -30,6 +30,9 @@ $root = $PSScriptRoot
 # Fusion shows the add-in under this name (folder == manifest == dll base name).
 $AddinName = 'HSMAdvisor Plugin'
 
+$Version = ([regex]::Match((Get-Content "$root\HSMAdvisorPlugin.manifest" -Raw), '"version"\s*:\s*"([^"]+)"')).Groups[1].Value
+if (-not $Version) { throw "Could not read version from HSMAdvisorPlugin.manifest" }
+
 function Find-VS {
     $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
     if (-not (Test-Path $vswhere)) { throw "vswhere.exe not found - install Visual Studio with the 'Desktop development with C++' workload." }
@@ -67,7 +70,8 @@ $csc = Join-Path $vs 'MSBuild\Current\Bin\Roslyn\csc.exe'
 $hsm = Find-HSMAdvisor
 Write-Host "Visual Studio : $vs"
 Write-Host "HSMAdvisor    : $hsm"
-Write-Host "Configuration : $Configuration`n"
+Write-Host "Configuration : $Configuration"
+Write-Host "Version       : $Version`n"
 
 # 1) native add-in (HSMAdvisorPlugin.dll)
 & $msbuild "$root\HSMAdvisorPlugin.vcxproj" /t:Build /p:Configuration=$Configuration /p:Platform=x64 /m /nologo /v:minimal
@@ -118,9 +122,18 @@ if ($Package) {
         "$env:LOCALAPPDATA\Programs\Inno Setup*\ISCC.exe" `
         -ErrorAction SilentlyContinue | Select-Object -First 1
     if (-not $iscc) { throw "Inno Setup (ISCC.exe) not found - install it or run without -Package." }
-    & $iscc.FullName "$root\installer\HSMAdvisorPlugin.iss"
+    # Pass the manifest version into the .iss (single source of truth).
+    & $iscc.FullName "/DMyVersion=$Version" "$root\installer\HSMAdvisorPlugin.iss"
     if ($LASTEXITCODE -ne 0) { throw "Inno Setup build failed." }
     Write-Host "Installer built in: $root\installer\Output"
+
+    
+    try {
+        if (-not (& git -C $root tag --list "v$Version")) {
+            Write-Warning "No git tag 'v$Version' yet - remember to tag the release."
+        }
+    }
+    catch { }
 }
 
 Write-Host "`nDone."
