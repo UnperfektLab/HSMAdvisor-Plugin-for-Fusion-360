@@ -33,15 +33,38 @@ Ptr<UserInterface> ui;
 
 static const char* kCmdId = "HSMAdvisorTestCmd";
 
+// Lowercased copy of a string (ASCII).
+static std::string toLower(std::string s)
+{
+    for (char& c : s) if (c >= 'A' && c <= 'Z') c += 32;
+    return s;
+}
+
 // Parameter helpers. CAM lengths come back in centimeters (*10 -> mm); we write
 // values back as expressions with unit tokens (rpm/mmpm/mm) so Fusion converts them
 // to the document's display units.
-static double readLenMm(const Ptr<CAMParameters>& params, const std::string& name, double fallback)
+
+// Typed value of a parameter (nullptr if absent or wrong type).
+template <typename T>
+static Ptr<T> paramValue(const Ptr<CAMParameters>& params, const std::string& name)
 {
     Ptr<CAMParameter> p = params ? params->itemByName(name) : nullptr;
-    if (!p) return fallback;
-    Ptr<FloatParameterValue> fv = p->value();
-    return fv ? fv->value() * 10.0 : fallback; // cm -> mm
+    return p ? Ptr<T>(p->value()) : nullptr;
+}
+
+// Evaluated numeric value of a float parameter (internal units).
+static bool readFloatVal(const Ptr<CAMParameters>& params, const std::string& name, double& out)
+{
+    Ptr<FloatParameterValue> fv = paramValue<FloatParameterValue>(params, name);
+    if (!fv) return false;
+    out = fv->value();
+    return true;
+}
+
+static double readLenMm(const Ptr<CAMParameters>& params, const std::string& name, double fallback)
+{
+    double v;
+    return readFloatVal(params, name, v) ? v * 10.0 : fallback; // cm -> mm
 }
 
 // Reads the first candidate length that exists on this strategy.
@@ -50,52 +73,40 @@ static double readFirstLenMm(const Ptr<CAMParameters>& params,
 {
     for (const std::string& name : candidates)
     {
-        Ptr<CAMParameter> p = params ? params->itemByName(name) : nullptr;
-        if (!p) continue;
-        Ptr<FloatParameterValue> fv = p->value();
-        if (fv) return fv->value() * 10.0; // cm -> mm
+        double v;
+        if (readFloatVal(params, name, v)) return v * 10.0; // cm -> mm
     }
     return 0.0;
 }
 
 static int readInt(const Ptr<CAMParameters>& params, const std::string& name, int fallback)
 {
-    Ptr<CAMParameter> p = params ? params->itemByName(name) : nullptr;
-    if (!p) return fallback;
-    Ptr<IntegerParameterValue> iv = p->value();
+    Ptr<IntegerParameterValue> iv = paramValue<IntegerParameterValue>(params, name);
     return iv ? iv->value() : fallback;
 }
 
 // CAM angle parameters return value() already in degrees. So read it straight, no radian conversion.
 static double readAngleDeg(const Ptr<CAMParameters>& params, const std::string& name, double fallback)
 {
-    Ptr<CAMParameter> p = params ? params->itemByName(name) : nullptr;
-    if (!p) return fallback;
-    Ptr<FloatParameterValue> fv = p->value();
-    return fv ? fv->value() : fallback;
+    double v;
+    return readFloatVal(params, name, v) ? v : fallback;
 }
 
 static bool readBool(const Ptr<CAMParameters>& params, const std::string& name, bool fallback)
 {
-    Ptr<CAMParameter> p = params ? params->itemByName(name) : nullptr;
-    if (!p) return fallback;
-    Ptr<BooleanParameterValue> bv = p->value();
+    Ptr<BooleanParameterValue> bv = paramValue<BooleanParameterValue>(params, name);
     return bv ? bv->value() : fallback;
 }
 
 static std::string readChoice(const Ptr<CAMParameters>& params, const std::string& name, const std::string& fallback)
 {
-    Ptr<CAMParameter> p = params ? params->itemByName(name) : nullptr;
-    if (!p) return fallback;
-    Ptr<ChoiceParameterValue> cv = p->value();
+    Ptr<ChoiceParameterValue> cv = paramValue<ChoiceParameterValue>(params, name);
     return cv ? cv->value() : fallback;
 }
 
 static std::string readString(const Ptr<CAMParameters>& params, const std::string& name)
 {
-    Ptr<CAMParameter> p = params ? params->itemByName(name) : nullptr;
-    if (!p) return "";
-    Ptr<StringParameterValue> sv = p->value();
+    Ptr<StringParameterValue> sv = paramValue<StringParameterValue>(params, name);
     return sv ? sv->value() : "";
 }
 
@@ -104,16 +115,6 @@ static std::string readExpr(const Ptr<CAMParameters>& params, const std::string&
 {
     Ptr<CAMParameter> p = params ? params->itemByName(name) : nullptr;
     return p ? p->expression() : std::string();
-}
-
-// Evaluated numeric value of a float parameter (internal units). false if absent.
-static bool readFloatVal(const Ptr<CAMParameters>& params, const std::string& name, double& out)
-{
-    Ptr<CAMParameter> p = params ? params->itemByName(name) : nullptr;
-    Ptr<FloatParameterValue> fv = p ? p->value() : nullptr;
-    if (!fv) return false;
-    out = fv->value();
-    return true;
 }
 
 // Flank half-angle (degrees, measured from the tool axis) used to convert a chamfer's
@@ -139,8 +140,7 @@ static bool isChamferEngagement(const Ptr<Operation>& op)
 {
     if (!op) return false;
 
-    std::string strat = op->strategy();
-    for (char& c : strat) if (c >= 'A' && c <= 'Z') c += 32;
+    std::string strat = toLower(op->strategy());
 
     // 2D Chamfer operation (strategy id contains "chamfer").
     if (strat.find("chamfer") != std::string::npos)
@@ -150,8 +150,7 @@ static bool isChamferEngagement(const Ptr<Operation>& op)
     if (strat.find("contour") != std::string::npos)
     {
         Ptr<Tool> tool = op->tool();
-        std::string toolType = readChoice(tool ? tool->parameters() : nullptr, "tool_type", "");
-        for (char& c : toolType) if (c >= 'A' && c <= 'Z') c += 32;
+        std::string toolType = toLower(readChoice(tool ? tool->parameters() : nullptr, "tool_type", ""));
         if (toolType.find("chamfer") != std::string::npos)
             return true;
     }
@@ -190,6 +189,7 @@ static std::string firstExistingName(const Ptr<CAMParameters>& params,
 static std::string friendlyParamName(const std::string& raw)
 {
     if (raw == "tool_spindleSpeed") return "Spindle speed";
+    if (raw == "tool_rampSpindleSpeed") return "Ramp spindle speed";
     if (raw == "tool_feedCutting")  return "Cutting feed";
     if (raw == "tool_feedPlunge")   return "Plunge feed";
     if (raw == "tool_feedRamp")     return "Ramp feed";
@@ -446,10 +446,10 @@ static Ptr<Operation> selectedOperation()
 }
 
 // State shared between the launch main thread, the host-done handler, and the
-// "what to apply" chooser (all on the main thread).
+// results dialog (all on the main thread).
 static bool g_hostBusy = false;
 static Ptr<Operation> g_pendingOp;
-static std::map<std::string, std::string> g_pendingResult; // last host result, for the chooser
+static std::map<std::string, std::string> g_pendingResult; // last host result, for the results dialog
 static const char* kApplyCmdId = "HSMAdvisorApplyCmd";
 static Ptr<CommandDefinition> g_applyCmdDef;
 
@@ -542,8 +542,9 @@ static void planHostResult(const Ptr<Operation>& op, const std::map<std::string,
     if (!op)
         return;
 
-    // Plunge RPM and SFM are returned by the host but intentionally not applied for now.
+    // SFM is returned by the host but intentionally not applied for now.
     int    rpm        = (int)strtod(kvGet(out, "rpm", "0").c_str(), nullptr);
+    int    rpmPlunge  = (int)strtod(kvGet(out, "rpmPlunge", "0").c_str(), nullptr);
     double feedCut    = strtod(kvGet(out, "feedCut", "0").c_str(), nullptr);
     double feedPlunge = strtod(kvGet(out, "feedPlunge", "0").c_str(), nullptr);
     double doc        = strtod(kvGet(out, "doc", "0").c_str(), nullptr);
@@ -562,9 +563,7 @@ static void planHostResult(const Ptr<Operation>& op, const std::map<std::string,
     std::string cutExpr = numToStr(feedCut, 1) + "mmpm";
 
     // If is drilling operations then set feed as plunge feed, otherwise set as cutting feed.
-    std::string strat = op->strategy();
-    for (char& c : strat) if (c >= 'A' && c <= 'Z') c += 32;
-    bool isDrill = (strat == "drill");
+    bool isDrill = (toLower(op->strategy()) == "drill");
     bool isChamfer = isChamferEngagement(op);
     const std::string feedParam = isDrill ? "tool_feedPlunge" : "tool_feedCutting";
 
@@ -586,7 +585,7 @@ static void planHostResult(const Ptr<Operation>& op, const std::map<std::string,
     {
         double val;
         if (!readFloatVal(ops, name, val)) return readExpr(ops, name); // no numeric value
-        if (category == "rpm") return numToStr(val, 0) + " rpm";
+        if (category == "rpm" || category == "plungeRpm") return numToStr(val, 0) + " rpm";
         bool isFeed = (category == "feed" || category == "plungeFeed" || category == "ramp");
         double display = isFeed ? (val * disp) : (val * 10.0 * disp);
         return numToStr(display, isFeed ? feedPrec : lenPrec) + " " + (isFeed ? feedUnit : lenUnit);
@@ -640,6 +639,14 @@ static void planHostResult(const Ptr<Operation>& op, const std::map<std::string,
         if (hasParam(ops, "tool_feedRamp"))
             add("ramp", "tool_feedRamp", plungeDisp,
                 { { "tool_feedRamp", plungeExpr } }, g_apply.all || g_apply.ramp);
+    }
+
+    // Plunge RPM (HSMAdvisor RPM_Plunge -> Fusion ramp spindle speed).
+    if (!isDrill && rpmPlunge > 0 && hasParam(ops, "tool_rampSpindleSpeed"))
+    {
+        std::string rpmPlungeExpr = numToStr((double)rpmPlunge, 0);
+        add("plungeRpm", "tool_rampSpindleSpeed", rpmPlungeExpr + " rpm",
+            { { "tool_rampSpindleSpeed", rpmPlungeExpr + "rpm" } }, g_apply.all || g_apply.plungeRpm);
     }
 
     // Depth of cut: milling -> maximumStepdown; drilling -> peckingDepth; chamfer ->
@@ -763,6 +770,7 @@ public:
 
             // Remember the choice per category so the next run defaults the same way.
             if      (item.category == "rpm")        g_apply.rpm        = on;
+            else if (item.category == "plungeRpm")  g_apply.plungeRpm  = on;
             else if (item.category == "feed")       g_apply.feed       = on;
             else if (item.category == "plungeFeed") g_apply.plungeFeed = on;
             else if (item.category == "ramp")       g_apply.ramp       = on;
