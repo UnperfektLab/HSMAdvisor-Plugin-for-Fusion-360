@@ -35,14 +35,14 @@ ArchitecturesAllowed=x64compatible
 
 [Files]
 Source: "{#DistDir}\{#AddinName}.dll";            DestDir: "{app}"; Flags: ignoreversion
-Source: "{#DistDir}\HSMAdvisorPluginHost.exe";    DestDir: "{app}"; Flags: ignoreversion
+Source: "{#DistDir}\HSMAdvisorIntegration.dll";   DestDir: "{app}"; Flags: ignoreversion
 Source: "{#DistDir}\{#AddinName}.manifest";       DestDir: "{app}"; Flags: ignoreversion
 Source: "{#DistDir}\AddInIcon.svg";               DestDir: "{app}"; Flags: ignoreversion
 Source: "{#DistDir}\resources\HSMAdvisorPlugin\*";  DestDir: "{app}\resources\HSMAdvisorPlugin"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#DistDir}\README.md";                   DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#DistDir}\LICENSE";                     DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 
-; Remove runtime files the plugin creates (settings.xml, apply_prefs.txt) and the
+; Remove runtime files the plugin creates (settings.txt, apply_prefs.txt) and the
 ; now-empty add-in folder on uninstall.
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}"
@@ -51,11 +51,24 @@ Type: filesandordirs; Name: "{app}"
 const
   NL = #13#10;
 
+// Software\HSMAdvisor\ExePath is written by the HSMAdvisor installer (HKCU per-user, HKLM all users,
+// where the 32-bit installer's value lands in the 32-bit view).
+function HSMAdvisorExeRegistered(): Boolean;
+var
+  Exe: String;
+begin
+  Result :=
+    (RegQueryStringValue(HKCU, 'Software\HSMAdvisor', 'ExePath', Exe) and FileExists(Exe)) or
+    (RegQueryStringValue(HKLM32, 'Software\HSMAdvisor', 'ExePath', Exe) and FileExists(Exe)) or
+    (IsWin64 and RegQueryStringValue(HKLM64, 'Software\HSMAdvisor', 'ExePath', Exe) and FileExists(Exe));
+end;
+
 function HSMAdvisorInstalled(): Boolean;
 begin
   Result :=
+    HSMAdvisorExeRegistered() or
     FileExists(ExpandConstant('{localappdata}\Programs\HSMAdvisor\HSMAdvisorCore.dll')) or
-    FileExists(ExpandConstant('{commonpf}\HSMAdvisor\HSMAdvisorCore.dll')) or
+    FileExists(ExpandConstant('{commonpf32}\HSMAdvisor\HSMAdvisorCore.dll')) or
     FileExists(ExpandConstant('{commonpf64}\HSMAdvisor\HSMAdvisorCore.dll'));
 end;
 

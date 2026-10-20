@@ -13,9 +13,11 @@ x64/
 *.ipdb
 *.log
 
+# ...but not the vendored HSMAdvisor integration client
+!third_party/hsmadvisor/x64/
+
 # Built artifacts (produced by build.ps1 into the add-in folder)
 HSMAdvisorPlugin.dll
-HSMAdvisorPluginHost.exe
 
 # Installer build output
 installer/Output/
@@ -29,6 +31,7 @@ dist/
 apply_prefs.txt
 dpi_mode.txt
 settings.xml
+settings.txt
 
 # OS
 Thumbs.db

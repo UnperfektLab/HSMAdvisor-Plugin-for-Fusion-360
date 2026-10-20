@@ -33,10 +33,8 @@ tool, and apply the result back to the operation. Similar in spirit to
 
 - Windows 10 (1903+) or Windows 11, 64-bit.
 - Autodesk Fusion 360.
-- HSMAdvisor, installed and licensed (<https://hsmadvisor.com/download>). Run it once
-  so its database is set up.
+- HSMAdvisor 3.2.1 or later, installed and licensed (<https://hsmadvisor.com/download>).
 - .NET Framework 4.8 (ships with Windows 10 1903+ and Windows 11).
-
 ## Install
 
 Click the button above to download the installer and run it. It checks for HSMAdvisor,
@@ -63,15 +61,19 @@ then in Fusion press **Shift+S → Add-Ins → HSMAdvisor Plugin → Run** (tick
 4. Tick which values to apply, click **OK**, then regenerate the toolpath.
 
 You can apply spindle RPM, feedrate, depth of cut (ad), width of cut (ae), or all. If
-the tool is found in your HSMAdvisor database (by description or product id), its saved
-data is loaded. The last material, machine, and options are remembered in the plugin's
-own settings file. Fusion stays responsive while the window is open. The first open in
-a session loads the database once (a few seconds); later opens are instant.
+the tool is in your HSMAdvisor tool library under the same name as its Fusion description
+or product id, its saved data is loaded. The last material, machine, and options are
+remembered in the plugin's own settings file. Fusion stays responsive while the window is
+open. The first open in a session starts HSMAdvisor in the background (a few seconds);
+later opens are instant.
 
 ## Troubleshooting
 
 - **"HSMAdvisor could not be started."** HSMAdvisor is not installed or licensed.
   Install it, run it once, then retry.
+- **"This integration requires HSMAdvisor 3.2.1 or newer..."** Update HSMAdvisor.
+- **"HSMAdvisor already has a dialog open."** Another integration (e.g. Mastercam) has an
+  HSMAdvisor dialog open. Close it, then retry.
 - **No button.** Enable the add-in: **Shift+S → Add-Ins → HSMAdvisor Plugin → Run**.
   It lives in the Manage panel of the Milling and Turning tabs.
 - **"Could not read a valid tool diameter."** Select a milling or drilling operation
@@ -82,25 +84,33 @@ a session loads the database once (a few seconds); later opens are instant.
 ## Build from source
 
 Requires Visual Studio 2022/2026 with the **Desktop development with C++** workload
-(MSVC, Windows SDK, and the bundled Roslyn C# compiler), plus HSMAdvisor and Fusion 360
-installed. From a PowerShell prompt in the repo root:
+(MSVC and Windows SDK) and Fusion 360 installed. HSMAdvisor is only needed to run the
+add-in. From a PowerShell prompt in the repo root:
 
 ```powershell
 .\build.ps1              # Release build to "dist\HSMAdvisor Plugin"
 .\build.ps1 -Package     # also build the Inno Setup installer
 ```
 
-`build.ps1` locates Visual Studio and your HSMAdvisor installation automatically.
+`build.ps1` locates Visual Studio automatically. `third_party/` holds HSMAdvisor's native
+integration client (headers and `x64/HSMAdvisorIntegration.dll`) and
+[nlohmann/json](https://github.com/nlohmann/json) 3.11.3 (MIT).
 
 ## How it works
 
-The native add-in (`HSMAdvisor Plugin.dll`) launches a separate host process
-(`HSMAdvisorPluginHost.exe`) that shows the HSMAdvisor dialog. Running it out of process
-keeps the controls from overlapping (a DPI issue when the dialog runs inside Fusion) and
-keeps Fusion responsive; the two talk over a named pipe and the result is applied on the
-main thread. The host loads HSMAdvisor's engine DLLs from your installation, so your
-HSMAdvisor stays independently updatable and is never modified. Settings live in the
-plugin's own `settings.xml`.
+The add-in (`HSMAdvisor Plugin.dll`) talks to your installed HSMAdvisor through
+`HSMAdvisorIntegration.dll`, HSMAdvisor's native integration client. It starts HSMAdvisor
+in the background when needed and sends it the operation's tool and cut over a local named
+pipe. HSMAdvisor shows its calculator in its own process, owned by the Fusion window, so the
+dialog renders correctly and Fusion stays responsive. Clicking OK sends the result back,
+and the add-in applies it on Fusion's main thread. HSMAdvisor exits a few seconds after
+Fusion closes.
+
+The copy of `HSMAdvisorIntegration.dll` that newer HSMAdvisor versions install is used when
+present, so the client stays matched to your HSMAdvisor. The copy shipped with the add-in
+is the fallback for HSMAdvisor 3.2.0. Nothing from HSMAdvisor is loaded into Fusion's
+process, and your HSMAdvisor installation is never modified. Settings live in the plugin's
+own `settings.txt`.
 
 ## License
 
@@ -111,4 +121,4 @@ copy of HSMAdvisor.
 ## Credits
 
 - HSMAdvisor © Eldar Gerfanov, HSMAdvisor Inc., <https://hsmadvisor.com/>.
-- HSMAdvisor DLL SDK and demo: <https://github.com/swindex/HSMAdvisor-DLL-Test>.
+- HSMAdvisor integration client and demo: <https://github.com/swindex/HSMAdvisor.Integration-Demo>.

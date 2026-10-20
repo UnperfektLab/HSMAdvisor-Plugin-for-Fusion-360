@@ -1,17 +1,17 @@
 <#
     build.ps1 - builds the HSMAdvisor Plugin for Fusion 360 add-in.
 
-    Produces the native add-in and the dialog host (HSMAdvisorPluginHost.exe), and
-    assembles the drop-in folder under "dist\HSMAdvisor Plugin" (folder/dll/manifest
-    are all named "HSMAdvisor Plugin" so Fusion lists the add-in under that name).
+    Produces the native add-in and assembles the drop-in folder under
+    "dist\HSMAdvisor Plugin" (folder/dll/manifest are all named "HSMAdvisor Plugin" so
+    Fusion lists the add-in under that name), together with the bundled copy of
+    HSMAdvisor's native integration client (third_party\hsmadvisor\x64\HSMAdvisorIntegration.dll).
 
     Requirements:
       - Visual Studio 2022/2026 with the "Desktop development with C++" workload
-        (MSVC + Windows SDK) and the Roslyn C# compiler (bundled).
-      - HSMAdvisor installed (https://hsmadvisor.com/download) - its DLLs are
-        referenced at build time and loaded from the installation at runtime.
+        (MSVC + Windows SDK).
       - Fusion 360 installed (its C++ API headers live under
         %APPDATA%\Autodesk\Autodesk Fusion 360\API\CPP).
+      HSMAdvisor itself is only needed to run the add-in, not to build it.
 
     Usage:
       .\build.ps1                 # Release build + assemble dist\
@@ -42,34 +42,11 @@ function Find-VS {
     return $vs
 }
 
-function Find-HSMAdvisor {
-    $keys = @(
-        'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
-        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
-        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
-    )
-    foreach ($r in $keys) {
-        if (-not (Test-Path $r)) { continue }
-        foreach ($k in Get-ChildItem $r -ErrorAction SilentlyContinue) {
-            $p = Get-ItemProperty $k.PSPath -ErrorAction SilentlyContinue
-            if ($p.DisplayName -match 'HSMAdvisor' -and $p.InstallLocation `
-                    -and (Test-Path (Join-Path $p.InstallLocation 'HSMAdvisorCore.dll'))) {
-                return $p.InstallLocation.TrimEnd('\')
-            }
-        }
-    }
-    foreach ($c in @("$env:LOCALAPPDATA\Programs\HSMAdvisor", "$env:ProgramFiles\HSMAdvisor")) {
-        if (Test-Path (Join-Path $c 'HSMAdvisorCore.dll')) { return $c }
-    }
-    throw "HSMAdvisor installation not found - install it from https://hsmadvisor.com/download first."
-}
-
 $vs = Find-VS
 $msbuild = Join-Path $vs 'MSBuild\Current\Bin\MSBuild.exe'
-$csc = Join-Path $vs 'MSBuild\Current\Bin\Roslyn\csc.exe'
-$hsm = Find-HSMAdvisor
+$integrationDll = Join-Path $root 'third_party\hsmadvisor\x64\HSMAdvisorIntegration.dll'
+if (-not (Test-Path $integrationDll)) { throw "Bundled HSMAdvisorIntegration.dll not found: $integrationDll" }
 Write-Host "Visual Studio : $vs"
-Write-Host "HSMAdvisor    : $hsm"
 Write-Host "Configuration : $Configuration"
 Write-Host "Version       : $Version`n"
 
@@ -78,21 +55,13 @@ Write-Host "Version       : $Version`n"
 if ($LASTEXITCODE -ne 0) { throw "MSBuild failed." }
 $dll = Join-Path $root "$Configuration\HSMAdvisorPlugin.dll"
 
-# 2) dialog host (HSMAdvisorPluginHost.exe), referencing the installed HSMAdvisor DLLs
-$hostExe = Join-Path $root 'HSMAdvisorPluginHost.exe'
-& $csc /nologo /target:winexe /platform:x64 /langversion:latest `
-    /reference:"$hsm\HSMAdvisorCore.dll" /reference:"$hsm\HSMAdvisorDatabase.dll" `
-    /reference:'System.Windows.Forms.dll' /reference:'System.Drawing.dll' `
-    /reference:'System.dll' /reference:'System.Core.dll' /reference:'System.Xml.dll' `
-    /out:"$hostExe" "$root\HSMAdvisorPluginHost\Program.cs"
-if ($LASTEXITCODE -ne 0) { throw "Host (C#) build failed." }
-
-# 3) assemble the drop-in folder (folder/dll/manifest all named "$AddinName")
+# 2) assemble the drop-in folder (folder/dll/manifest all named "$AddinName")
 $dist = Join-Path $root "dist\$AddinName"
 if (Test-Path (Join-Path $root 'dist')) { Remove-Item (Join-Path $root 'dist') -Recurse -Force }
 New-Item -ItemType Directory -Force -Path (Join-Path $dist 'resources\HSMAdvisorPlugin') | Out-Null
 Copy-Item $dll (Join-Path $dist "$AddinName.dll")
-Copy-Item $hostExe $dist
+# fallback copy of the integration client; the one installed with HSMAdvisor is preferred
+Copy-Item $integrationDll $dist
 Copy-Item "$root\HSMAdvisorPlugin.manifest" (Join-Path $dist "$AddinName.manifest")
 Copy-Item "$root\AddInIcon.svg" $dist
 Copy-Item "$root\resources\HSMAdvisorPlugin\*.png" (Join-Path $dist 'resources\HSMAdvisorPlugin')
@@ -101,7 +70,7 @@ foreach ($f in 'LICENSE', 'README.md') {
 }
 Write-Host "`nAssembled drop-in folder: $dist"
 
-# 4) optional: deploy into Fusion's AddIns folder for local testing
+# 3) optional: deploy into Fusion's AddIns folder for local testing
 if ($Deploy) {
     $addins = Join-Path $env:APPDATA "Autodesk\Autodesk Fusion 360\API\AddIns\$AddinName"
     New-Item -ItemType Directory -Force -Path (Join-Path $addins 'resources\HSMAdvisorPlugin') | Out-Null
@@ -114,7 +83,7 @@ if ($Deploy) {
     }
 }
 
-# 5) optional installer
+# 4) optional installer
 if ($Package) {
     $iscc = Get-ChildItem `
         "${env:ProgramFiles(x86)}\Inno Setup*\ISCC.exe", `

@@ -11,18 +11,29 @@
 #include <windows.h>
 #include <urlmon.h>
 #include <shellapi.h>
+#include <winhttp.h>
 #include <string>
 #include <sstream>
 #include <fstream>
 #include <vector>
 #include <map>
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <cmath>
+#include <mutex>
+#include <regex>
 #include <thread>
+
+// HSMAdvisor's native integration client (loaded at run time) and the JSON it exchanges.
+#include <hsmadvisor/hsmadvisor_integration_loader.h>
+#include <nlohmann/json.hpp>
 
 #pragma comment(lib, "urlmon.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "winhttp.lib")
+
+using json = nlohmann::ordered_json;
 
 using namespace adsk::core;
 using namespace adsk::fusion;
@@ -225,10 +236,7 @@ static std::wstring utf8ToWide(const std::string& s)
     return out;
 }
 
-// HSMAdvisorPluginHost.exe interop. The dialog runs in a separate, DPI-unaware
-// process so its WinForms controls don't overlap the way they do inside
-// Fusion's DPI-aware process. Tool + result are exchanged as key=value
-// text over a named pipe, and the add-in never loads the CLR itself.
+// Folder of this add-in's DLL (manifest, prefs, settings, bundled HSMAdvisorIntegration.dll).
 static const std::string& addinFolder()
 {
     static const std::string dir = []() -> std::string {
@@ -311,132 +319,698 @@ static void saveApplyPrefs()
       << "rampAngle=" << (g_apply.rampAngle ? 1 : 0) << "\n";
 }
 
-static const char*    kHostDoneEventId = "HSMAdvisorHostDoneEvent";
-static const char*    kPipeShortName   = "HSMAdvisorFusionHost";
-static const wchar_t* kPipeFullName    = L"\\\\.\\pipe\\HSMAdvisorFusionHost";
+static const char* kHostDoneEventId = "HSMAdvisorHostDoneEvent";
 
-// The host's response text, produced on the worker thread and consumed by the
-// custom-event handler on the main thread. Only one request is in flight at a time.
+typedef std::map<std::string, std::string> KvMap;
+
+// The result as key=value text (see planHostResult), produced on the worker thread and
+// consumed by the custom-event handler on the main thread. Only one request is in flight at a time.
 static std::string g_pendingResponse;
 
-// Launches the host in warm "server" mode (loads the HSMAdvisor database once, then
-// serves requests over a named pipe). A second launch is harmless, the host uses a
-// single-instance mutex and the extra process exits immediately. Returns the process
-// handle (caller closes it) or nullptr if the host exe could not be started at all.
-static HANDLE launchHostServer()
+// ---- HSMAdvisor integration client -------------------------------------------------------------
+// HSMAdvisor runs as its own process and serves integrations over a named pipe; its dialogs open
+// in that process, owned by Fusion's window. HSMAdvisorIntegration.dll is the native client: the
+// copy installed with HSMAdvisor is preferred, the one shipped next to this add-in is the fallback.
+
+static const char* kMinimumHSMAdvisor = "3.2.1"; // integration server with the "high_speed_machining" cut key
+static hsma_api g_hsma;
+static hsma_load_result g_hsmaLoad = HSMA_LOAD_NOT_FOUND;
+static hsma_client* g_client = nullptr;
+
+// The request in flight and its cancellation token. Both are only touched on Fusion's main thread
+// (run, stop, the command handler); the worker only uses the token it was given.
+static std::thread g_worker;
+static hsma_cancel* g_cancel = nullptr;
+static std::atomic<bool> g_stopping(false);
+
+// This add-in's version (from its manifest).
+static std::string pluginVersion()
 {
-    std::string dir = addinFolder();
-    std::string exe = dir + "\\HSMAdvisorPluginHost.exe";
-    std::string cmd = "\"" + exe + "\" --server " + kPipeShortName;
-
-    std::wstring wcmd = utf8ToWide(cmd);
-    std::wstring wdir = utf8ToWide(dir);
-    std::vector<wchar_t> cmdbuf(wcmd.begin(), wcmd.end());
-    cmdbuf.push_back(L'\0');
-
-    STARTUPINFOW si = { sizeof(si) };
-    PROCESS_INFORMATION pi = {0};
-    if (!CreateProcessW(nullptr, cmdbuf.data(), nullptr, nullptr, FALSE,
-                        0, nullptr, wdir.c_str(), &si, &pi))
-        return nullptr;
-    CloseHandle(pi.hThread);
-    return pi.hProcess;
+    std::string version = "0.0.0";
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA((addinFolder() + "\\*.manifest").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return version;
+    do
+    {
+        std::ifstream f((addinFolder() + "\\" + fd.cFileName).c_str(), std::ios::binary);
+        std::stringstream ss;
+        ss << f.rdbuf();
+        std::string text = ss.str();
+        std::smatch m;
+        if (std::regex_search(text, m, std::regex("\"version\"\\s*:\\s*\"([^\"]+)\"")))
+        {
+            version = m[1];
+            break;
+        }
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    return version;
 }
 
-// Connects to the host pipe, retrying until timeout. If hProc is given, also bails out the moment
-// that processexits before serving (e.g. HSMAdvisor not installed -> host exits with code 2),
-// so it fail fast instead of waiting the whole timeout. Returns INVALID_HANDLE_VALUE on failure,
-// writing the process exit code to procExitCode when the process ended.
-static HANDLE connectHostPipe(DWORD timeoutMs, HANDLE hProc = nullptr, DWORD* procExitCode = nullptr)
+// ---- update check (GitHub Releases) ----------------------------------------------------------
+
+static std::mutex g_updateLock;
+static std::string g_updateVersion, g_updateUrl; // set when a newer release exists
+static std::thread g_updateThread;
+static bool g_updateStarted = false;
+
+static std::vector<int> parseVer(std::string s)
 {
-    DWORD start = GetTickCount();
-    for (;;)
+    s.erase(0, s.find_first_not_of("vV"));
+    std::vector<int> r(3, 0);
+    std::istringstream ss(s);
+    std::string part;
+    for (int i = 0; i < 3 && std::getline(ss, part, '.'); ++i)
+        r[i] = std::atoi(part.c_str()); // stops at the first non-digit ("1-beta" -> 1)
+    return r;
+}
+
+static int compareVersions(const std::string& a, const std::string& b)
+{
+    std::vector<int> pa = parseVer(a), pb = parseVer(b);
+    for (int i = 0; i < 3; ++i)
+        if (pa[i] != pb[i]) return pa[i] < pb[i] ? -1 : 1;
+    return 0;
+}
+
+// HTTPS GET with short timeouts; "" on any failure.
+static std::string httpsGet(const wchar_t* host, const wchar_t* path)
+{
+    std::string body;
+    HINTERNET session = WinHttpOpen(L"HSMAdvisorPlugin-update-check", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                                    WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    HINTERNET connect = session ? WinHttpConnect(session, host, INTERNET_DEFAULT_HTTPS_PORT, 0) : nullptr;
+    HINTERNET request = connect ? WinHttpOpenRequest(connect, L"GET", path, nullptr, WINHTTP_NO_REFERER,
+                                                     WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE) : nullptr;
+    if (request)
     {
-        HANDLE h = CreateFileW(kPipeFullName, GENERIC_READ | GENERIC_WRITE, 0,
-                               nullptr, OPEN_EXISTING, 0, nullptr);
-        if (h != INVALID_HANDLE_VALUE)
-            return h;
-        if (GetLastError() == ERROR_PIPE_BUSY)
-            WaitNamedPipeW(kPipeFullName, 1000);
-        else
-            Sleep(200); // pipe not created yet
-        if (hProc && WaitForSingleObject(hProc, 0) == WAIT_OBJECT_0)
+        WinHttpSetTimeouts(request, 3000, 3000, 3000, 3000);
+        DWORD statusCode = 0, size = sizeof(statusCode);
+        if (WinHttpSendRequest(request, L"Accept: application/vnd.github+json\r\n", (DWORD)-1L,
+                               WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+            WinHttpReceiveResponse(request, nullptr) &&
+            WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                                WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &size, WINHTTP_NO_HEADER_INDEX) &&
+            statusCode == 200)
         {
-            if (procExitCode) GetExitCodeProcess(hProc, procExitCode);
-            return INVALID_HANDLE_VALUE; // host died before it could serve
+            char buf[8192];
+            DWORD read = 0;
+            while (WinHttpReadData(request, buf, sizeof(buf), &read) && read > 0)
+                body.append(buf, read);
         }
-        if (GetTickCount() - start > timeoutMs)
-            return INVALID_HANDLE_VALUE;
+    }
+    if (request) WinHttpCloseHandle(request);
+    if (connect) WinHttpCloseHandle(connect);
+    if (session) WinHttpCloseHandle(session);
+    return body;
+}
+
+static void checkForUpdate()
+{
+    json release = json::parse(httpsGet(L"api.github.com",
+        L"/repos/UnperfektLab/HSMAdvisor-Plugin-for-Fusion-360/releases/latest"), nullptr, false);
+    if (!release.is_object() || !release.contains("tag_name") || !release["tag_name"].is_string()) return;
+    std::string tag = release["tag_name"].get<std::string>();
+    if (compareVersions(tag, pluginVersion()) <= 0) return;
+
+    std::string url;
+    if (release.contains("assets") && release["assets"].is_array())
+    {
+        for (const json& asset : release["assets"])
+        {
+            if (!asset.is_object() || !asset.contains("browser_download_url") || !asset["browser_download_url"].is_string())
+                continue;
+            std::string u = asset["browser_download_url"].get<std::string>();
+            if (u.size() < 4 || toLower(u.substr(u.size() - 4)) != ".exe") continue;
+            url = u;
+            if (toLower(u).find("setup") != std::string::npos) break;
+        }
+    }
+    std::lock_guard<std::mutex> guard(g_updateLock);
+    g_updateVersion = tag;
+    g_updateUrl = url;
+}
+
+// Starts the update check once per session (skipped when no_update_check.txt exists).
+static void startUpdateCheck()
+{
+    std::lock_guard<std::mutex> guard(g_updateLock);
+    if (g_updateStarted) return;
+    g_updateStarted = true;
+    if (GetFileAttributesA((addinFolder() + "\\no_update_check.txt").c_str()) != INVALID_FILE_ATTRIBUTES) return;
+    g_updateThread = std::thread(checkForUpdate);
+}
+
+// ---- requests -------------------------------------------------------------------------------
+
+struct HsmResult
+{
+    int status = HSMA_ERROR;
+    json payload;
+    std::string code, message;
+};
+
+// One request to HSMAdvisor (blocking; worker thread only).
+static HsmResult hsmRequest(const char* type, const json* payload, long long ownerWindow, hsma_cancel* cancel)
+{
+    HsmResult r;
+    char* p = nullptr;
+    char* e = nullptr;
+    std::string text = payload ? payload->dump(-1, ' ', false, json::error_handler_t::replace) : std::string();
+    r.status = g_hsma.request(g_client, type, payload ? text.c_str() : nullptr, ownerWindow, cancel, &p, &e);
+    if (p) r.payload = json::parse(p, nullptr, false);
+    if (e)
+    {
+        json err = json::parse(e, nullptr, false);
+        if (err.is_object())
+        {
+            r.code = err.value("code", "");
+            r.message = err.value("message", "");
+        }
+    }
+    g_hsma.free_memory(p);
+    g_hsma.free_memory(e);
+    if (r.status == HSMA_OK && !r.payload.is_object())
+    {
+        r.status = HSMA_ERROR;
+        r.code = HSMA_ERR_IO;
+        r.message = "HSMAdvisor sent an invalid response.";
+    }
+    return r;
+}
+
+// Failures of the connection itself (as opposed to a message HSMAdvisor rejected).
+static bool isClientFailure(const HsmResult& r)
+{
+    return r.code == HSMA_ERR_NOT_INSTALLED || r.code == HSMA_ERR_VERSION_TOO_OLD ||
+           r.code == HSMA_ERR_TIMEOUT || r.code == HSMA_ERR_IO;
+}
+
+static std::string friendlyError(const HsmResult& r)
+{
+    if (r.status == HSMA_BUSY)
+        return "HSMAdvisor already has a dialog open. Finish or close it, then try again.";
+    if (r.code == HSMA_ERR_NOT_INSTALLED)
+        return "HSMAdvisor could not be started. Make sure HSMAdvisor is installed and licensed "
+               "(https://hsmadvisor.com/download), then try again.";
+    if (r.code == HSMA_ERR_TIMEOUT)
+        return "HSMAdvisor did not start in time. Please try again.";
+    // version_too_old: the message names both versions and the download page
+    return r.message.empty() ? "HSMAdvisor returned an error (" + r.code + ")." : r.message;
+}
+
+// A string field of a JSON record ("" when absent); numbers are returned as text.
+static std::string jstr(const json& o, const char* key)
+{
+    if (!o.is_object()) return "";
+    auto it = o.find(key);
+    if (it == o.end()) return "";
+    if (it->is_string()) return it->get<std::string>();
+    if (it->is_number()) return it->dump();
+    return "";
+}
+
+static std::string trimmed(const std::string& s)
+{
+    size_t b = s.find_first_not_of(" \t\r\n"), e = s.find_last_not_of(" \t\r\n");
+    return b == std::string::npos ? std::string() : s.substr(b, e - b + 1);
+}
+
+// ---- Fusion tool -> HSMAdvisor tool -------------------------------------------------------------
+
+// HSMAdvisor tool type ids (name_id).
+enum HsmToolType
+{
+    TT_SolidEndMill = 1, TT_IndexedFaceMill = 5, TT_VbitEngraver = 6, TT_JobberTwistDrill = 9,
+    TT_Reamer = 10, TT_ThreadMill = 15, TT_Tap = 19, TT_Counterbore = 21, TT_ChamferMill = 22,
+    TT_SolidBallMill = 24, TT_IndexedBallMill = 25, TT_BoringHead = 26, TT_WoodRuff = 27,
+    TT_SpotDrill = 29, TT_CounterSink = 30, TT_Unknown = 99
+};
+
+// Maps a Fusion tool type to the nearest HSMAdvisor one.
+// Notes: the chamfer mill is also Fusion's engraving tool, so engraving is told apart by the
+// operation strategy. Types with no equivalent map to Unknown, which writes no geometry at all
+// (see fieldsFor) and leaves the dialog for the user to fill in.
+static int mapToolType(const std::string& type, const std::string& strategy)
+{
+    std::string t = toLower(type);
+    bool engrave = toLower(strategy).find("engrave") != std::string::npos;
+
+    // --- mills ---
+    if (t == "flat end mill" || t == "bull nose end mill" || t == "tapered mill" || t == "form mill") return TT_SolidEndMill;
+    if (t == "ball end mill" || t == "circle segment taper") return TT_SolidBallMill;
+    if (t == "lollipop mill") return TT_IndexedBallMill;
+    if (t == "face mill") return TT_IndexedFaceMill;
+    if (t == "thread mill") return TT_ThreadMill;
+    if (t == "dovetail mill" || t == "slot mill") return TT_WoodRuff; // nearest to a T-slot cutter
+    // Same tool for chamfering and engraving; tell them apart by the operation.
+    if (t == "chamfer mill" || t == "corner chamfer end mill") return engrave ? TT_VbitEngraver : TT_ChamferMill;
+
+    // --- drilling ---
+    if (t == "drill" || t == "block drill") return TT_JobberTwistDrill;
+    if (t == "spot drill" || t == "center drill") return TT_SpotDrill;
+    if (t == "counter bore") return TT_Counterbore;
+    if (t == "counter sink") return TT_CounterSink;
+    if (t == "reamer") return TT_Reamer;
+    if (t == "boring bar") return TT_BoringHead;
+    if (t == "tap right hand" || t == "tap left hand") return TT_Tap;
+
+    // radius mill, circle segment barrel/oval/lens, turning, jet, probe...: no HSMAdvisor equivalent
+    return TT_Unknown;
+}
+
+// HSMAdvisor tool material ids (tool_material_id).
+static int mapToolMaterial(const std::string& material)
+{
+    std::string m = toLower(material);
+    if (m.find("carbide") != std::string::npos) return 5;
+    if (m.find("cobalt") != std::string::npos) return 4;
+    if (m.find("hss") != std::string::npos || m.find("high speed steel") != std::string::npos) return 1;
+    if (m.find("ceramic") != std::string::npos) return 10;
+    if (m.find("pcd") != std::string::npos) return 7;
+    return 5;
+}
+
+// Which geometry fields each HSMAdvisor tool type actually exposes.
+enum GeoField
+{
+    G_Dia = 1, G_TipDia = 2, G_Flutes = 4, G_FluteLen = 8, G_ShoulderLen = 16, G_ShoulderDia = 32,
+    G_Shank = 128, G_Corner = 256, G_Angle = 512, G_Pitch = 1024, G_Stickout = 2048,
+    G_All = G_Dia | G_TipDia | G_Flutes | G_FluteLen | G_ShoulderLen | G_ShoulderDia | G_Shank |
+            G_Corner | G_Angle | G_Pitch | G_Stickout
+};
+
+// Helix angle is deliberately never written for any type (HSMAdvisor uses the type's default).
+static int fieldsFor(int tt)
+{
+    switch (tt)
+    {
+    case TT_Tap:           return 0; // nothing is written for a tap for now
+    case TT_Unknown:       return 0; // unmapped Fusion types: write nothing
+    case TT_CounterSink:   return G_Dia | G_TipDia | G_Flutes | G_Shank | G_Angle | G_Stickout;
+    case TT_ChamferMill:
+    case TT_VbitEngraver:
+    case TT_JobberTwistDrill:
+    case TT_SpotDrill:     return G_Dia | G_Flutes | G_FluteLen | G_Shank | G_Angle | G_Stickout;
+    case TT_Reamer:
+    case TT_Counterbore:   return G_Dia | G_Flutes | G_Stickout;
+    // Turn dia = diameter, insert length = flute length, "holder size" = shank diameter.
+    case TT_BoringHead:    return G_Dia | G_Flutes | G_FluteLen | G_Shank | G_Stickout;
+    case TT_ThreadMill:    return G_Dia | G_Flutes | G_FluteLen | G_ShoulderLen | G_ShoulderDia | G_Shank | G_Pitch | G_Stickout;
+    case TT_SolidEndMill:
+    case TT_IndexedFaceMill:
+    case TT_WoodRuff:      return G_Dia | G_Flutes | G_FluteLen | G_ShoulderLen | G_ShoulderDia | G_Shank | G_Corner | G_Angle | G_Stickout;
+    case TT_SolidBallMill:
+    case TT_IndexedBallMill: return G_Dia | G_Flutes | G_FluteLen | G_ShoulderLen | G_ShoulderDia | G_Shank | G_Angle | G_Stickout;
+    default:               return G_All;
     }
 }
 
-// Sends the request to the warm host over the pipe on a worker thread (launching the
-// host if needed), then fires the custom event so the result is applied on Fusion's
-// main thread. Never blocks Fusion's UI thread.
-static void sendToHostAsync(const std::string& request)
+// What the add-in read from the selected operation (lengths in mm, angles in degrees).
+struct HsmRequest
 {
-    std::thread([request]()
-    {
-        std::string resp;
-        HANDLE h = connectHostPipe(1500);   // quick try
-        if (h == INVALID_HANDLE_VALUE)
-        {
-            DWORD exitCode = STILL_ACTIVE;
-            HANDLE hProc = launchHostServer();
-            if (!hProc)
-            {
-                resp = "status=error\nerror=The HSMAdvisor host component "
-                       "(HSMAdvisorPluginHost.exe) is missing. Reinstall the add-in.\n";
-            }
-            else
-            {
-                h = connectHostPipe(30000, hProc, &exitCode); // wait for first-time DB load
-                CloseHandle(hProc);
-                if (h == INVALID_HANDLE_VALUE)
-                {
-                    if (exitCode == 0)
-                        h = connectHostPipe(30000); // another instance already exist
-                    else if (exitCode != STILL_ACTIVE)
-                        resp = "status=error\nerror=HSMAdvisor could not be started. Make sure "
-                               "HSMAdvisor is installed and licensed (https://hsmadvisor.com/download), "
-                               "then try again.\n";
-                }
-            }
-        }
+    std::string description, productId, strategy, toolType, toolMaterial;
+    double diameter = 0, tipDiameter = 0, cornerRadius = 0, taperAngle = 0, tipAngle = 0;
+    double shoulderDiameter = 0, threadPitch = 0, fluteLength = 0, shoulderLength = 0, shaftDiameter = 0;
+    double stickout = 0, docIn = 0, wocIn = 0, rampAngle = 0;
+    int flutes = 0;
+    bool rampHelix = false;
+    long long ownerWindow = 0;
+};
 
-        if (h != INVALID_HANDLE_VALUE)
-        {
-            std::string req = request + "END\n";
-            DWORD written = 0;
-            WriteFile(h, req.data(), (DWORD)req.size(), &written, nullptr);
-            char buf[4096];
-            DWORD rd = 0;
-            while (ReadFile(h, buf, sizeof(buf), &rd, nullptr) && rd > 0)
-                resp.append(buf, rd);   // closes the pipe after the response
-            CloseHandle(h);
-        }
-        else if (resp.empty())
-        {
-            resp = "status=error\nerror=Could not reach the HSMAdvisor host process.\n";
-        }
-
-        g_pendingResponse = resp;
-        if (app)
-            app->fireCustomEvent(kHostDoneEventId, "");
-    }).detach();
+// A metric length: the value plus its unit flag (record values are strings).
+static void setMm(json& record, const char* name, const char* flag, double mm)
+{
+    record[name] = numToStr(mm, 4);
+    record[flag] = "1";
 }
 
-// Asks the warm host to exit.
-static void quitHost()
+// The tool record from Fusion's geometry.
+static json toolGeometry(const HsmRequest& r)
 {
-    HANDLE h = CreateFileW(kPipeFullName, GENERIC_READ | GENERIC_WRITE, 0,
-                           nullptr, OPEN_EXISTING, 0, nullptr);
-    if (h == INVALID_HANDLE_VALUE)
-        return;
-    std::string req = "cmd=quit\nEND\n";
-    DWORD written = 0;
-    WriteFile(h, req.data(), (DWORD)req.size(), &written, nullptr);
-    CloseHandle(h);
+    json tool = json::object();
+    int tt = mapToolType(r.toolType, r.strategy);
+    int has = fieldsFor(tt);
+    if (tt != TT_Unknown) tool["name_id"] = std::to_string(tt); // unknown: HSMAdvisor's default type, the user picks
+    tool["tool_material_id"] = std::to_string(mapToolMaterial(r.toolMaterial));
+    tool["coating_id"] = "1"; // none
+    // Name the tool as Fusion does (else HSMAdvisor generates one): description, else product id.
+    std::string desc = trimmed(r.description), pid = trimmed(r.productId);
+    if (!desc.empty() || !pid.empty()) tool["comment"] = desc.empty() ? pid : desc;
+    if (!pid.empty()) tool["supplier_pid"] = pid;
+
+    if ((has & G_Flutes) && r.flutes > 0) tool["Flute_N"] = std::to_string(r.flutes);
+    if ((has & G_FluteLen) && r.fluteLength > 0) setMm(tool, "Flute_Len", "flute_len_mm", r.fluteLength);
+    if ((has & G_ShoulderLen) && r.shoulderLength > 0) setMm(tool, "Shoulder_Len", "shoulder_len_mm", r.shoulderLength);
+    if ((has & G_ShoulderDia) && r.shoulderDiameter > 0) setMm(tool, "Shoulder_Dia", "Shoulder_Dia_mm", r.shoulderDiameter);
+    // Shank_Dia is shown as "holder size" on a boring head; it still takes Fusion's shaft diameter.
+    if ((has & G_Shank) && r.shaftDiameter > 0) setMm(tool, "Shank_Dia", "Shank_Dia_mm", r.shaftDiameter);
+    if ((has & G_Corner) && r.cornerRadius > 0) setMm(tool, "corner_rad", "corner_rad_mm", r.cornerRadius);
+    if ((has & G_Pitch) && r.threadPitch > 0)
+    {
+        tool["thread_pitch"] = numToStr(r.threadPitch, 4);
+        tool["thread_pitch_m"] = "1";
+    }
+
+    std::string tl = toLower(r.toolType);
+    bool isThread = tl.find("thread") != std::string::npos;
+    bool isPointTool = tl.find("counter sink") != std::string::npos || tl.find("drill") != std::string::npos;
+    if (!isThread && (has & G_Angle))
+    {
+        // HSMAdvisor stores a lead angle plus the mode the UI shows it in. Point tools (countersink,
+        // drills) are defined by their tip angle; everything else by the taper, written even when 0
+        // so the tool cannot keep HSMAdvisor's default lead angle.
+        if (isPointTool && r.tipAngle > 0)
+        {
+            tool["leadangle_mode"] = "2"; // tip
+            tool["leadangle"] = numToStr(90.0 - r.tipAngle / 2.0, 4);
+        }
+        else
+        {
+            double taper = tl.find("dovetail") != std::string::npos ? -r.taperAngle : r.taperAngle;
+            tool["leadangle_mode"] = "1"; // taper
+            tool["leadangle"] = numToStr(90.0 - taper, 4);
+        }
+    }
+
+    // HSMAdvisor's single diameter field is labelled "tip diameter", but for most types that is
+    // really the tool diameter. Use Fusion's tip diameter only for the genuinely tapered types.
+    bool useTipDia = tt == TT_ChamferMill || tt == TT_VbitEngraver;
+    // Pointed tools (V-bits) report a 0 tip diameter, which HSMAdvisor rejects: use a tiny one.
+    double dia = useTipDia ? (r.tipDiameter > 0.001 ? r.tipDiameter : 0.001) : r.diameter;
+    setMm(tool, "diameter", "diameter_mm", dia);
+    if (has & G_TipDia) setMm(tool, "Tip_Diameter", "Tip_Diameter_mm", r.tipDiameter > 0 ? r.tipDiameter : r.diameter);
+    return tool;
+}
+
+// Finds the tool in the user's HSMAdvisor library by exact name: description, then product id.
+// Returns false (tool untouched) when it is not there; sets error on a connection failure.
+static bool findLibraryTool(const HsmRequest& r, hsma_cancel* cancel, json& tool, HsmResult& failure)
+{
+    for (const std::string* name : { &r.description, &r.productId })
+    {
+        std::string key = trimmed(*name);
+        if (key.empty()) continue;
+        json query = { { "comment", key } };
+        HsmResult hits = hsmRequest("FindTools", &query, 0, cancel);
+        if (hits.status == HSMA_CANCELLED || (hits.status != HSMA_OK && isClientFailure(hits)))
+        {
+            failure = hits;
+            return false;
+        }
+        if (hits.status != HSMA_OK || !hits.payload.contains("tools") || !hits.payload["tools"].is_array() ||
+            hits.payload["tools"].empty())
+            continue;
+
+        json get = { { "guid", jstr(hits.payload["tools"][0], "guid") } };
+        HsmResult loaded = hsmRequest("GetTool", &get, 0, cancel);
+        if (loaded.status == HSMA_CANCELLED || (loaded.status != HSMA_OK && isClientFailure(loaded)))
+        {
+            failure = loaded;
+            return false;
+        }
+        if (loaded.status == HSMA_OK && loaded.payload.contains("tool") && loaded.payload["tool"].is_object())
+        {
+            tool = loaded.payload["tool"];
+            tool.erase("Cuts"); // the library tool's saved cuts are not part of a calculation
+            return true;
+        }
+    }
+    return false;
+}
+
+// ---- last-used settings ------------------------------------------------------------------------
+// Material / machine / productivity / HSM mode / units the user last chose, in the add-in folder.
+
+struct LastSettings
+{
+    std::string materialId, machineId, productivity, hss;
+    bool metric = true;
+};
+
+static std::string settingsPath() { return addinFolder() + "\\settings.txt"; }
+
+static std::string readFile(const std::string& path)
+{
+    std::ifstream f(path.c_str(), std::ios::binary);
+    std::stringstream ss;
+    ss << f.rdbuf();
+    return ss.str();
+}
+
+// <tag>value</tag> of the settings.xml earlier versions wrote.
+static std::string xmlTag(const std::string& text, const std::string& tag)
+{
+    size_t b = text.find("<" + tag + ">");
+    if (b == std::string::npos) return "";
+    b += tag.size() + 2;
+    size_t e = text.find("</" + tag + ">", b);
+    return e == std::string::npos ? "" : trimmed(text.substr(b, e - b));
+}
+
+static LastSettings loadLastSettings()
+{
+    LastSettings s;
+    std::string text = readFile(settingsPath());
+    if (!text.empty())
+    {
+        KvMap m = parseKvText(text);
+        s.materialId = kvGet(m, "material_id", "");
+        s.machineId = kvGet(m, "machine_id", "");
+        s.productivity = kvGet(m, "productivity", "");
+        s.hss = kvGet(m, "hss", "");
+        s.metric = kvGet(m, "metric", "1") == "1";
+        return s;
+    }
+    std::string xml = readFile(addinFolder() + "\\settings.xml"); // written by versions up to 0.4
+    if (!xml.empty())
+    {
+        s.materialId = xmlTag(xml, "material_id");
+        s.machineId = xmlTag(xml, "machine_id");
+        s.productivity = xmlTag(xml, "productivity");
+        s.hss = xmlTag(xml, "hsm");
+        s.metric = xmlTag(xml, "metric") != "0";
+    }
+    return s;
+}
+
+static void saveLastSettings(const json& cut)
+{
+    std::string material = jstr(cut, "material_id");
+    std::ofstream f(settingsPath().c_str(), std::ios::binary);
+    if (!f) return;
+    if (!material.empty() && material != "0") f << "material_id=" << material << "\n";
+    if (!jstr(cut, "machine_id").empty()) f << "machine_id=" << jstr(cut, "machine_id") << "\n";
+    if (!jstr(cut, "productivity").empty()) f << "productivity=" << jstr(cut, "productivity") << "\n";
+    f << "hss=" << (jstr(cut, "high_speed_machining") == "1" ? "1" : "0") << "\n";
+    f << "metric=" << (jstr(cut, "input_units_mm") == "0" ? "0" : "1") << "\n";
+}
+
+// ---- the request ---------------------------------------------------------------------------------
+
+// Seeds HSMAdvisor with the operation's tool and cut, lets the user edit it in the HSMAdvisor
+// calculator and returns the result (mm, mm/min) as the key=value map planHostResult consumes.
+static KvMap processRequest(const HsmRequest& r, hsma_cancel* cancel)
+{
+    KvMap out;
+    out["status"] = "error";
+    if (g_hsmaLoad != HSMA_LOAD_OK || !g_client)
+    {
+        out["error"] = g_hsmaLoad == HSMA_LOAD_TOO_OLD
+            ? "The HSMAdvisor integration component (HSMAdvisorIntegration.dll) is outdated. Update HSMAdvisor or reinstall the add-in."
+            : "The HSMAdvisor integration component (HSMAdvisorIntegration.dll) is missing. Reinstall the add-in.";
+        return out;
+    }
+    startUpdateCheck();
+
+    auto fail = [&](const HsmResult& res) {
+        if (res.status == HSMA_CANCELLED) out["status"] = "cancel";
+        else out["error"] = friendlyError(res);
+        return out;
+    };
+
+    // 1. The tool: the user's library tool when it is there (its saved data), else Fusion's geometry.
+    json tool;
+    HsmResult failure;
+    failure.status = HSMA_OK;
+    bool found = findLibraryTool(r, cancel, tool, failure);
+    if (failure.status != HSMA_OK) return fail(failure);
+    if (!found) tool = toolGeometry(r);
+
+    // 2. The cut. Stick-out is editable even for a library tool, so take Fusion's (body length):
+    // deflection and rigidity then reflect the real setup. Skipped for types that don't take it.
+    json cut = json::object();
+    if (r.stickout > 0 && (fieldsFor(mapToolType(r.toolType, r.strategy)) & G_Stickout))
+        setMm(tool, "stickout", "stickout_mm", r.stickout);
+    // The cut's diameter and stick-out win over the tool's, and an absent cut unit flag would turn
+    // the tool's millimetres into inches: send them on the cut too, with the tool's flags.
+    for (const char* name : { "diameter", "stickout" })
+    {
+        std::string flag = std::string(name) + "_mm";
+        if (jstr(tool, name).empty()) continue;
+        cut[name] = jstr(tool, name);
+        cut[flag] = jstr(tool, flag.c_str()).empty() ? "0" : jstr(tool, flag.c_str());
+    }
+    // The operation's engagement seeds HSMAdvisor's cut.
+    if (r.docIn > 0) setMm(cut, "doc", "doc_mm", r.docIn);
+    if (r.wocIn > 0) setMm(cut, "woc", "woc_mm", r.wocIn);
+    if (r.rampAngle > 0) cut["ramp"] = numToStr(r.rampAngle, 4); // degrees
+    if (r.rampHelix)
+    {
+        cut["rampmilling"] = "0";
+        cut["circle_comp"] = "1";
+    }
+
+    // Open where the previous run left off: material, machine, productivity, HSM, units.
+    LastSettings last = loadLastSettings();
+    cut["material_id"] = last.materialId.empty() ? "227" : last.materialId; // default until one is picked
+    cut["productivity"] = last.productivity.empty() ? "4" : last.productivity; // slider -> x1.0
+    if (!last.machineId.empty()) cut["machine_id"] = last.machineId;
+    if (!last.hss.empty()) cut["high_speed_machining"] = last.hss;
+    cut["input_units_mm"] = last.metric ? "1" : "0";
+    cut["result_units_mm"] = last.metric ? "1" : "0";
+
+    // 3. The HSMAdvisor calculator, owned by Fusion's window.
+    std::string prompt = "Select workpiece material and machine, then click OK to apply to Fusion.";
+    if (!found)
+    {
+        std::string desc = trimmed(r.description), pid = trimmed(r.productId);
+        prompt = "Tool not found in your HSMAdvisor library (" + (desc.empty() ? std::string("no description") : desc) +
+                 (pid.empty() ? std::string() : ", " + pid) + "). Check the tool and cut values, then click OK to apply to Fusion.";
+    }
+    // tool_is_new defaults to true: a library tool must say it is not, or auto-save adds it twice.
+    json edit = { { "calculation", { { "tool", tool }, { "cut", cut }, { "tool_is_new", !found } } }, { "prompt", prompt }, { "calculate_first", true } };
+    HsmResult edited = hsmRequest("EditCalculation", &edit, r.ownerWindow, cancel);
+    if (edited.status != HSMA_OK) return fail(edited);
+    if (!edited.payload.contains("calculation") || !edited.payload["calculation"].is_object())
+    {
+        out["error"] = "HSMAdvisor returned no calculation.";
+        return out;
+    }
+    json calculation = edited.payload["calculation"];
+    if (calculation.contains("cut")) saveLastSettings(calculation["cut"]);
+
+    // 4. Always report millimetres: the add-in writes them back with mm unit tokens.
+    json convert = { { "calculation", calculation }, { "metric", true } };
+    HsmResult metric = hsmRequest("ConvertUnits", &convert, 0, cancel);
+    if (metric.status != HSMA_OK) return fail(metric);
+    json result = metric.payload.contains("calculation") ? metric.payload["calculation"] : json::object();
+    json resultCut = result.is_object() && result.contains("cut") ? result["cut"] : json::object();
+
+    out["status"] = "ok";
+    out["error"] = "";
+    out["rpm"] = jstr(resultCut, "rpm");
+    out["rpmPlunge"] = jstr(resultCut, "rpm_plunge");
+    out["feedCut"] = jstr(resultCut, "feed");
+    out["feedPlunge"] = jstr(resultCut, "feed_plunge");
+    out["doc"] = jstr(resultCut, "doc");
+    out["woc"] = jstr(resultCut, "woc");
+    out["peck"] = jstr(resultCut, "peck");
+    out["sfm"] = jstr(resultCut, "sfm");
+    out["chipload"] = jstr(resultCut, "ipt");
+    out["rampAngleOut"] = jstr(resultCut, "ramp");
+
+    // Attach update info if a newer release was found by now.
+    std::lock_guard<std::mutex> guard(g_updateLock);
+    if (!g_updateVersion.empty())
+    {
+        out["updateVersion"] = g_updateVersion;
+        out["currentVersion"] = pluginVersion();
+        if (!g_updateUrl.empty()) out["updateUrl"] = g_updateUrl;
+    }
+    return out;
+}
+
+static std::string toKvText(const KvMap& m)
+{
+    std::string text;
+    for (const auto& kv : m)
+    {
+        std::string v = kv.second;
+        std::replace(v.begin(), v.end(), '\r', ' ');
+        std::replace(v.begin(), v.end(), '\n', ' ');
+        text += kv.first + "=" + v + "\n";
+    }
+    return text;
+}
+
+// Fusion's main window, which owns the HSMAdvisor dialog so it stays in front of Fusion.
+static BOOL CALLBACK findTopLevelWindow(HWND hwnd, LPARAM param)
+{
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid == GetCurrentProcessId() && IsWindowVisible(hwnd) && !GetWindow(hwnd, GW_OWNER))
+    {
+        *(HWND*)param = hwnd;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static long long fusionMainWindow()
+{
+    HWND fg = GetForegroundWindow();
+    DWORD pid = 0;
+    if (fg) GetWindowThreadProcessId(fg, &pid);
+    if (fg && pid == GetCurrentProcessId())
+        return (long long)(INT_PTR)GetAncestor(fg, GA_ROOTOWNER);
+    HWND found = nullptr;
+    EnumWindows(findTopLevelWindow, (LPARAM)&found);
+    return (long long)(INT_PTR)found;
+}
+
+// Waits for the previous request's worker and releases its token (main thread).
+static void finishWorker()
+{
+    if (g_worker.joinable()) g_worker.join();
+    if (g_cancel)
+    {
+        g_hsma.cancel_destroy(g_cancel);
+        g_cancel = nullptr;
+    }
+}
+
+// Runs the request on a worker thread, then fires the custom event so the result is applied on
+// Fusion's main thread. Never blocks Fusion's UI thread.
+static void runHsmAdvisorAsync(const HsmRequest& request)
+{
+    finishWorker(); // one request at a time: the previous one already delivered its result
+    g_cancel = g_hsmaLoad == HSMA_LOAD_OK ? g_hsma.cancel_create() : nullptr;
+    hsma_cancel* cancel = g_cancel;
+    g_worker = std::thread([request, cancel]()
+    {
+        g_pendingResponse = toKvText(processRequest(request, cancel));
+        if (app && !g_stopping)
+            app->fireCustomEvent(kHostDoneEventId, "");
+    });
+}
+
+// Connects the add-in to the integration client (run()).
+static void startHsmAdvisorClient()
+{
+    g_stopping = false; // the add-in can be stopped and run again in one Fusion session
+    std::wstring bundled = utf8ToWide(addinFolder() + "\\HSMAdvisorIntegration.dll");
+    g_hsmaLoad = hsma_load(&g_hsma, bundled.c_str());
+    if (g_hsmaLoad != HSMA_LOAD_OK) return;
+    g_client = g_hsma.client_create("HSMAdvisor Plugin for Fusion 360", pluginVersion().c_str());
+    if (g_client) g_hsma.client_set_minimum_version(g_client, kMinimumHSMAdvisor);
+}
+
+// Closes an open HSMAdvisor dialog, waits for the request to end and releases the client (stop()).
+// HSMAdvisor itself exits a few seconds after Fusion is gone.
+static void stopHsmAdvisorClient()
+{
+    g_stopping = true;
+    if (g_cancel) g_hsma.cancel_signal(g_cancel);
+    finishWorker();
+    if (g_updateThread.joinable()) g_updateThread.join();
+    if (g_client)
+    {
+        g_hsma.client_destroy(g_client);
+        g_client = nullptr;
+    }
+    if (g_hsmaLoad == HSMA_LOAD_OK) hsma_unload(&g_hsma);
+    g_hsmaLoad = HSMA_LOAD_NOT_FOUND;
 }
 
 // Finds the CAM operation among the current selections.
@@ -1005,35 +1579,34 @@ public:
             return;
         }
 
-        // --- build the request and send it to the warm host (non-blocking) ---
-        std::ostringstream req;
-        req << "showDialog=1\n"
-            << "description=" << toolDesc << "\n"
-            << "productId=" << toolPid << "\n"
-            << "strategy=" << opStrategy << "\n"
-            << "toolType=" << toolType << "\n"
-            << "toolMaterial=" << toolMat << "\n"
-            << "diameter=" << numToStr(diameter, 4) << "\n"
-            << "tipDiameter=" << numToStr(tipDia, 4) << "\n"
-            << "flutes=" << flutes << "\n"
-            << "cornerRadius=" << numToStr(cornerRad, 4) << "\n"
-            << "taperAngle=" << numToStr(taperAngle, 4) << "\n"
-            << "tipAngle=" << numToStr(tipAngle, 4) << "\n"
-            << "shoulderDiameter=" << numToStr(shoulderDia, 4) << "\n"
-            << "threadPitch=" << numToStr(threadPitch, 4) << "\n"
-            << "fluteLength=" << numToStr(fluteLen, 4) << "\n"
-            << "shoulderLength=" << numToStr(shoulder, 4) << "\n"
-            << "overallLength=" << numToStr(oal, 4) << "\n"
-            << "shaftDiameter=" << numToStr(shaftDia, 4) << "\n"
-            << "stickout=" << numToStr(stickout, 4) << "\n"
-            << "docIn=" << numToStr(docIn, 4) << "\n"
-            << "wocIn=" << numToStr(wocIn, 4) << "\n"
-            << "rampAngle=" << numToStr(rampAngle, 4) << "\n"
-            << "rampHelix=" << (isHelixRamp ? 1 : 0) << "\n";
+        // --- send the tool and cut to HSMAdvisor (non-blocking) ---
+        HsmRequest req;
+        req.description = toolDesc;
+        req.productId = toolPid;
+        req.strategy = opStrategy;
+        req.toolType = toolType;
+        req.toolMaterial = toolMat;
+        req.diameter = diameter;
+        req.tipDiameter = tipDia;
+        req.flutes = flutes;
+        req.cornerRadius = cornerRad;
+        req.taperAngle = taperAngle;
+        req.tipAngle = tipAngle;
+        req.shoulderDiameter = shoulderDia;
+        req.threadPitch = threadPitch;
+        req.fluteLength = fluteLen;
+        req.shoulderLength = shoulder;
+        req.shaftDiameter = shaftDia;
+        req.stickout = stickout;
+        req.docIn = docIn;
+        req.wocIn = wocIn;
+        req.rampAngle = rampAngle;
+        req.rampHelix = isHelixRamp;
+        req.ownerWindow = fusionMainWindow();
 
         g_pendingOp = op;
         g_hostBusy = true;
-        sendToHostAsync(req.str());
+        runHsmAdvisorAsync(req);
     }
 };
 
@@ -1068,8 +1641,9 @@ extern "C" XI_EXPORT bool run(const char* context)
         return false;
 
     loadApplyPrefs();
+    startHsmAdvisorClient();
 
-    // Custom event fired when the host process exits; its handler applies the result
+    // Custom event fired when HSMAdvisor has returned a result; its handler applies it
     // on Fusion's main thread.
     Ptr<CustomEvent> ce = app->registerCustomEvent(kHostDoneEventId);
     if (ce)
@@ -1154,7 +1728,7 @@ extern "C" XI_EXPORT bool stop(const char* context)
         ui = nullptr;
     }
 
-    quitHost(); // shut the warm host process down with the add-in
+    stopHsmAdvisorClient(); // closes an open HSMAdvisor dialog of this add-in
 
     if (app)
         app->unregisterCustomEvent(kHostDoneEventId);
