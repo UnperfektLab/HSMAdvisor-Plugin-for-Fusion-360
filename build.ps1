@@ -70,6 +70,13 @@ foreach ($f in 'LICENSE', 'README.md') {
 }
 Write-Host "`nAssembled drop-in folder: $dist"
 
+# Preserve the folder/manifest/DLL name when installing from a release ZIP.
+if ($Configuration -eq 'Release') {
+    $zip = Join-Path $root "dist\HSMAdvisorPlugin-$Version-windows-x64.zip"
+    Compress-Archive -LiteralPath $dist -DestinationPath $zip -CompressionLevel Optimal
+    Write-Host "Release ZIP: $zip"
+}
+
 # 3) optional: deploy into Fusion's AddIns folder for local testing
 if ($Deploy) {
     $addins = Join-Path $env:APPDATA "Autodesk\Autodesk Fusion 360\API\AddIns\$AddinName"

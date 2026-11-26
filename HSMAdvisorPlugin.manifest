@@ -1,6 +1,7 @@
 {
 	"autodeskProduct":	"Fusion",
 	"type":	"addin",
+	"id": "7de54632-9e31-4515-9751-3bddf0067581",
 	"author":	"UnperfektLab",
 	"description":	{
 		"":	"Unofficial plugin: brings HSMAdvisor feeds & speeds into Fusion 360. Requires a separately installed, licensed copy of HSMAdvisor."
